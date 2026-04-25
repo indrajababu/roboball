@@ -27,30 +27,29 @@ class StaticCameraTransform(Node):
     def __init__(self):
         super().__init__('static_camera_tf')
 
-        marker_number = int(self.declare_parameter('marker_number', 10).value)
-        child_frame = f'ar_marker_{marker_number}'
-        parent_frame = 'base_link'
+        marker_number = int(self.declare_parameter('marker_number', 5).value)
+        parent_frame = f'ar_marker_{marker_number}'
+        child_frame = 'base_link'
 
-        # G is the original ar_marker -> base_link transform; invert it so we
-        # can publish base_link -> ar_marker (base_link already has a parent
-        # from the robot URDF, so it cannot be a child of ar_marker).
+        # Publish ar_marker -> base_link so ar_marker keeps a single parent
+        # (camera frame from the ArUco node). Publishing base_link -> ar_marker
+        # conflicts with that and can disconnect the TF tree.
         G = np.array([
             [-1.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.16],
             [0.0, 1.0, 0.0, -0.13],
             [0.0, 0.0, 0.0, 1.0],
         ])
-        G_inv = np.linalg.inv(G)
 
         self.br = StaticTransformBroadcaster(self)
 
         self.transform = TransformStamped()
         self.transform.header.frame_id = parent_frame
         self.transform.child_frame_id = child_frame
-        self.transform.transform.translation.x = float(G_inv[0, 3])
-        self.transform.transform.translation.y = float(G_inv[1, 3])
-        self.transform.transform.translation.z = float(G_inv[2, 3])
-        q = R.from_matrix(G_inv[:3, :3]).as_quat()  # [x, y, z, w]
+        self.transform.transform.translation.x = float(G[0, 3])
+        self.transform.transform.translation.y = float(G[1, 3])
+        self.transform.transform.translation.z = float(G[2, 3])
+        q = R.from_matrix(G[:3, :3]).as_quat()  # [x, y, z, w]
         self.transform.transform.rotation.x = float(q[0])
         self.transform.transform.rotation.y = float(q[1])
         self.transform.transform.rotation.z = float(q[2])

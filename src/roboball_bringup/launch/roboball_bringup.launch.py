@@ -39,6 +39,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     ur_type = LaunchConfiguration('ur_type', default='ur7e')
     launch_rviz = LaunchConfiguration('launch_rviz', default='true')
+    marker_number = LaunchConfiguration('marker_number', default='10')
 
     realsense_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -74,6 +75,9 @@ def generate_launch_description():
         executable='static_camera_tf',
         name='static_camera_tf',
         output='screen',
+        parameters=[{
+            'marker_number': marker_number,
+        }],
     )
 
     aruco_node = Node(
@@ -127,6 +131,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('ur_type', default_value='ur7e'),
         DeclareLaunchArgument('launch_rviz', default_value='true'),
+        DeclareLaunchArgument('marker_number', default_value='10'),
         realsense_launch,
         moveit_launch,
         aruco_node,
