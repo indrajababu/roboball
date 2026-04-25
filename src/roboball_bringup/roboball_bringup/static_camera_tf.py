@@ -1,18 +1,18 @@
 """
-Static TF: `base_link` -> `camera_color_optical_frame` (externally-mounted camera).
+Static TF: `ar_marker_<n>` -> `base_link`.
 
-Seeded from lab5/planning/static_tf_transform.py. The lab version broadcast
-`wrist_3_link -> camera_depth_optical_frame`; for Roboball the camera is fixed
-in the environment, so we broadcast `base_link -> camera_color_optical_frame`
-instead.
+This uses the course-provided transform from the ArUco marker mounted at the
+robot base to the UR7e `base_link`:
 
-Procedure to fill in `G`:
-  1. Place an ArUco tag at a measured pose relative to `base_link` on the table.
-  2. Run lab7's aruco_node against the RealSense stream to get the tag pose in
-     the camera frame (call it `T_cam_tag`).
-  3. You know `T_base_tag` from step 1 (hand-measured).
-  4. Compose: `T_base_cam = T_base_tag @ inv(T_cam_tag)`.
-  5. Paste the resulting 4x4 into `G` below.
+G = np.array([
+    [-1, 0, 0,  0.0],
+    [ 0, 0, 1,  0.16],
+    [ 0, 1, 0, -0.13],
+    [ 0, 0, 0,  1.0]
+])
+
+With this broadcaster running, and an ArUco detector publishing camera->marker
+TF, the camera/base relationship is inferred through the TF tree.
 """
 
 import numpy as np
@@ -27,19 +27,16 @@ class StaticCameraTransform(Node):
     def __init__(self):
         super().__init__('static_camera_tf')
 
-        # TODO(step 3): replace with the measured base_link -> camera transform.
-        # Placeholder: camera 1.0 m in front of base_link, 0.7 m above the table,
-        # looking down and slightly back toward the robot.
-        G = np.eye(4)
-        G[0, 3] = 1.0     # x (m) — in front of robot
-        G[1, 3] = 0.0     # y (m)
-        G[2, 3] = 0.7     # z (m) — above table
-        # Rotate so the camera optical axis (+z_optical) points roughly back
-        # toward the robot and slightly down. Replace with your calibration.
-        G[:3, :3] = R.from_euler('xyz', [np.pi, 0.0, 0.0]).as_matrix()
+        marker_number = int(self.declare_parameter('marker_number', 5).value)
+        parent_frame = f'ar_marker_{marker_number}'
+        child_frame = 'base_link'
 
-        parent_frame = self.declare_parameter('parent_frame', 'base_link').value
-        child_frame = self.declare_parameter('child_frame', 'camera_color_optical_frame').value
+        G = np.array([
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.16],
+            [0.0, 1.0, 0.0, -0.13],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
 
         self.br = StaticTransformBroadcaster(self)
 
@@ -56,7 +53,8 @@ class StaticCameraTransform(Node):
         self.transform.transform.rotation.w = float(q[3])
 
         self.get_logger().info(
-            f'Broadcasting {parent_frame} -> {child_frame}\nG =\n{G}\nq = {q}'
+            f'Broadcasting {parent_frame} -> {child_frame}\n'
+            f'marker_number={marker_number}\nG =\n{G}\nq = {q}'
         )
 
         # StaticTransformBroadcaster latches, but we re-publish occasionally so
