@@ -34,7 +34,7 @@ class StrikePlanner(Node):
         self.create_subscription(StrikeTarget, '/strike_target', self._on_target, 10)
 
         self.ik_planner = IKPlanner()
-        self.executor = UR7eTrajectoryController(self)
+        self.controller = UR7eTrajectoryController(self)
 
         self._busy = False
         self.get_logger().info('Strike planner up. Waiting for /strike_target...')
@@ -73,7 +73,7 @@ class StrikePlanner(Node):
         traj = self._build_single_point_trajectory(ik_solution, time_to_impact)
 
         self._busy = True
-        ok = self.executor.execute_joint_trajectory(traj)
+        ok = self.controller.execute_joint_trajectory(traj)
         self._busy = False
 
         # TODO(step 7): replace the single-point action-based execution above

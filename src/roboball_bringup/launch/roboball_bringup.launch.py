@@ -49,6 +49,7 @@ def generate_launch_description():
             )
         ),
         launch_arguments={
+            'serial_no': "'843112070166'",
             'pointcloud.enable': 'true',
             'rgb_camera.color_profile': '1920x1080x30',
         }.items(),
