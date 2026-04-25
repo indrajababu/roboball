@@ -100,21 +100,66 @@ class TrajectoryPredictor(Node):
         -------
         (pos_now, vel_now, time_to_impact, impact_xyz, vel_at_impact) or None
         """
-        # TODO(step 6): implement the least-squares fit and the apex/height
-        # crossing solve. Pseudocode:
-        #   ts  = np.array([s[0] for s in self.samples])
-        #   xs  = np.vstack([s[1] for s in self.samples])
-        #   t0  = ts[-1]
-        #   dt  = ts - t0
-        #   # Fit x(t) = x0 + vx*dt  and  y(t) = y0 + vy*dt  via np.polyfit deg 1
-        #   # Fit z(t) = z0 + vz*dt - 0.5*g*dt^2  by subtracting the gravity
-        #   # term from zs and doing a deg-1 fit on the residual
-        #   # Solve for dt* where z(dt*) == strike_height on the descending branch
-        #   # pos_now  = [x0, y0, z0]
-        #   # vel_now  = [vx, vy, vz]
-        #   # impact_xyz = [x0 + vx*dt*, y0 + vy*dt*, strike_height]
-        #   # vel_at_impact = [vx, vy, vz - g*dt*]
-        return None
+        ts = np.array([s[0] for s in self.samples], dtype=np.float64)
+        pts = np.vstack([s[1] for s in self.samples]).astype(np.float64)
+
+        t0 = ts[-1]
+        dt = ts - t0
+
+        # Guard against degenerate timestamps (all samples at same time).
+        if np.ptp(dt) < 1e-6:
+            return None
+
+        xs = pts[:, 0]
+        ys = pts[:, 1]
+        zs = pts[:, 2]
+
+        # x(dt) = x0 + vx*dt
+        vx, x0 = np.polyfit(dt, xs, 1)
+        # y(dt) = y0 + vy*dt
+        vy, y0 = np.polyfit(dt, ys, 1)
+
+        # z(dt) = z0 + vz*dt - 0.5*g*dt^2
+        # => z(dt) + 0.5*g*dt^2 = z0 + vz*dt
+        z_linear = zs + 0.5 * GRAVITY * (dt ** 2)
+        vz, z0 = np.polyfit(dt, z_linear, 1)
+
+        pos_now = np.array([x0, y0, z0], dtype=np.float64)
+        vel_now = np.array([vx, vy, vz], dtype=np.float64)
+
+        # Solve for descending crossing of strike plane:
+        # z0 + vz*t - 0.5*g*t^2 = strike_height, with t >= 0.
+        a = -0.5 * GRAVITY
+        b = vz
+        c = z0 - self.strike_height
+        roots = np.roots(np.array([a, b, c], dtype=np.float64))
+
+        t_candidates = []
+        for r in roots:
+            if abs(r.imag) > 1e-7:
+                continue
+            t_hit = float(r.real)
+            if t_hit < 0.0:
+                continue
+            vz_at_hit = vz - GRAVITY * t_hit
+            # Prefer descending branch to avoid "upward" intersections.
+            if vz_at_hit <= 0.0:
+                t_candidates.append(t_hit)
+
+        if not t_candidates:
+            return pos_now, vel_now, None, None, None
+
+        t_impact = min(t_candidates)
+        impact_xyz = np.array(
+            [x0 + vx * t_impact, y0 + vy * t_impact, self.strike_height],
+            dtype=np.float64,
+        )
+        vel_impact = np.array(
+            [vx, vy, vz - GRAVITY * t_impact],
+            dtype=np.float64,
+        )
+
+        return pos_now, vel_now, t_impact, impact_xyz, vel_impact
 
 
 def main(args=None):
