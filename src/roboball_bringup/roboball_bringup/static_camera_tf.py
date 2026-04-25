@@ -27,7 +27,7 @@ class StaticCameraTransform(Node):
     def __init__(self):
         super().__init__('static_camera_tf')
 
-        marker_number = int(self.declare_parameter('marker_number', 5).value)
+        marker_number = int(self.declare_parameter('marker_number', 10).value)
         child_frame = f'ar_marker_{marker_number}'
         parent_frame = 'base_link'
 
