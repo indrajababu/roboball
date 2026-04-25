@@ -29,6 +29,7 @@ from builtin_interfaces.msg import Duration
 from tf2_ros import Buffer, TransformListener, TransformException
 
 from roboball_msgs.msg import StrikeTarget
+from roboball_planning.strike_objectives import ObjectiveConfig, StrikeObjectivePolicy
 from roboball_planning.ik import IKPlanner
 from roboball_planning.controller import PIDJointVelocityController
 from roboball_planning.trajectories import LinearTrajectory
@@ -52,6 +53,31 @@ EE_FRAME = 'tool0'
 class StrikePlanner(Node):
     def __init__(self):
         super().__init__('strike_planner')
+        objective_mode = str(self.declare_parameter('objective_mode', 'intercept').value)
+        blend_gain = float(self.declare_parameter('objective_blend_gain', 0.35).value)
+        center_xy = tuple(self.declare_parameter('objective_center_xy', [0.45, 0.0]).value)
+        zone_min_xy = tuple(self.declare_parameter('objective_zone_min_xy', [0.2, -0.3]).value)
+        zone_max_xy = tuple(self.declare_parameter('objective_zone_max_xy', [0.75, 0.3]).value)
+        human_xy = tuple(self.declare_parameter('objective_human_xy', [0.9, 0.0]).value)
+        circle_center_xy = tuple(
+            self.declare_parameter('objective_circle_center_xy', [0.45, 0.0]).value
+        )
+        circle_radius = float(self.declare_parameter('objective_circle_radius', 0.2).value)
+        circle_speed = float(self.declare_parameter('objective_circle_speed_rad_s', 0.7).value)
+
+        self.objective = StrikeObjectivePolicy(
+            ObjectiveConfig(
+                mode=objective_mode,
+                center_xy=(float(center_xy[0]), float(center_xy[1])),
+                zone_min_xy=(float(zone_min_xy[0]), float(zone_min_xy[1])),
+                zone_max_xy=(float(zone_max_xy[0]), float(zone_max_xy[1])),
+                human_xy=(float(human_xy[0]), float(human_xy[1])),
+                circle_center_xy=(float(circle_center_xy[0]), float(circle_center_xy[1])),
+                circle_radius=circle_radius,
+                circle_speed_rad_s=circle_speed,
+                blend_gain=blend_gain,
+            )
+        )
 
         # PID gains seeded from lab7/visual_servoing/main.py:58-60.
         Kp = 0.2 * np.array([0.4, 2.0, 1.7, 1.5, 2.0, 2.0])
@@ -84,7 +110,10 @@ class StrikePlanner(Node):
 
         self.create_timer(CONTROL_PERIOD_S, self._control_tick)
 
-        self.get_logger().info('Strike planner up. Waiting for /strike_target...')
+        self.get_logger().info(
+            f'Strike planner up. objective_mode={self.objective.config.mode}. '
+            'Waiting for /strike_target...'
+        )
 
     # -------------------------------------------------------------- subscriptions
 
@@ -115,6 +144,10 @@ class StrikePlanner(Node):
             msg.impact_pose.position.y,
             msg.impact_pose.position.z,
         ])
+        impact_xyz = self.objective.apply(
+            impact_xyz,
+            now_sec=self.get_clock().now().nanoseconds * 1e-9,
+        )
         q = msg.impact_pose.orientation
 
         time_to_impact = msg.time_to_impact.sec + msg.time_to_impact.nanosec * 1e-9
