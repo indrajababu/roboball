@@ -73,8 +73,8 @@ class BallDetector(Node):
         # ball + lighting. Set hsv_upper2 to all-zeros to disable the second
         # range (red wraps H=0/180, so red balls need both).
         self.enable_hsv = bool(self.declare_parameter('enable_hsv', True).value)
-        self.hsv_lower1 = list(self.declare_parameter('hsv_lower1', [20, 100, 100]).value)
-        self.hsv_upper1 = list(self.declare_parameter('hsv_upper1', [35, 255, 255]).value)
+        self.hsv_lower1 = list(self.declare_parameter('hsv_lower1', [0, 120, 80]).value)
+        self.hsv_upper1 = list(self.declare_parameter('hsv_upper1', [12, 255, 255]).value)
         self.hsv_lower2 = list(self.declare_parameter('hsv_lower2', [0, 0, 0]).value)
         self.hsv_upper2 = list(self.declare_parameter('hsv_upper2', [0, 0, 0]).value)
         self.min_color_points = int(self.declare_parameter('min_color_points', 20).value)
@@ -88,7 +88,7 @@ class BallDetector(Node):
             PointCloud2,
             '/camera/camera/depth/color/points',
             self.pointcloud_callback,
-            10,
+            qos_profile_sensor_data,
         )
 
         self.ball_pose_pub = self.create_publisher(PointStamped, '/ball_pose', 1)

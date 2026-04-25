@@ -76,6 +76,20 @@ def generate_launch_description():
         output='screen',
     )
 
+    aruco_node = Node(
+        package='ros2_aruco',
+        executable='aruco_node',
+        name='aruco_node',
+        output='screen',
+        parameters=[{
+            'marker_size': 0.15,
+            'aruco_dictionary_id': 'DICT_5X5_250',
+            'image_topic': '/camera/camera/color/image_raw',
+            'camera_info_topic': '/camera/camera/color/camera_info',
+            'camera_frame': 'camera_color_optical_frame',
+        }],
+    )
+
     validator_node = Node(
         package='roboball_planning',
         executable='validate_trajectory',
@@ -115,6 +129,7 @@ def generate_launch_description():
         DeclareLaunchArgument('launch_rviz', default_value='true'),
         realsense_launch,
         moveit_launch,
+        aruco_node,
         static_tf_node,
         validator_node,
         ball_detector_node,
