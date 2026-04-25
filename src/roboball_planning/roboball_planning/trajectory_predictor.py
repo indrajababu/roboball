@@ -32,7 +32,7 @@ class TrajectoryPredictor(Node):
 
         self.buffer_size = int(self.declare_parameter('buffer_size', 20).value)
         self.min_samples = int(self.declare_parameter('min_samples', 8).value)
-        self.strike_height = float(self.declare_parameter('strike_height', 0.5).value)
+        self.strike_height = float(self.declare_parameter('strike_height', 0.0).value)
 
         self.samples: "deque[tuple[float, np.ndarray]]" = deque(maxlen=self.buffer_size)
 
