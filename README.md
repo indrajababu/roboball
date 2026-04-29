@@ -71,41 +71,106 @@ The skeleton is in. These are the **stubs with TODOs** in the order you'll compl
 
 Full plan: `~/.claude/plans/look-through-the-labs-swift-teacup.md`.
 
-# Simulation
+Here is the finalized `README.md` for your project. This document integrates the M4-specific fixes, the unified workspace structure, and the troubleshooting steps we discovered during your setup today.
 
-Install Docker (from the website) for your OS
+```markdown
+# Roboball Simulation & Development Environment
 
-Make sure to open Docker
+This environment is designed for developing ROS 2 Humble applications on an M4 Mac and transitioning them seamlessly to the UC Berkeley CS lab machines. It utilizes a Docker-based Ubuntu 22.04 environment with a web-accessible desktop (noVNC).
 
-Install xhost for your OS
-brew install --cask xquartz
+## 🛠 Prerequisites
+* **Docker Desktop**: Installed and running.
+* **M4 Apple Silicon**: High-performance optimization for ARM64 architecture.
 
-Open xquartz, go to Settings > Security > Check "Allow Connections with Clients"
+---
 
-docker build -t ros2_lab_env .
+## 🚀 1. First-Time Setup
 
-if M4 chip:
-docker build --platform linux/arm64 -t ros2_lab_env .
+### Step A: Folder Structure
+To ensure code transfers seamlessly to the lab, maintain a unified ROS 2 workspace structure on your Mac:
+```text
+ROBOBALL/
+├── Dockerfile           # M4 web-env configuration
+├── .gitignore
+└── src/                 # All ROS 2 packages live here (Unified)
+    ├── roboball_bringup/    # Launch files
+    ├── roboball_msgs/       # Custom message definitions
+    ├── roboball_perception/ # Detection logic
+    ├── roboball_planning/   # Control/Movement logic
+    ├── simulation/          # Gazebo worlds and sim-specific configs
+    └── ros2_aruco/          # Third-party vision tools
+```
 
-To set up:
-1) Make sure that docker is open
-2) xhost + 127.0.0.1
-3) First time setup:
-    docker run -it \
-        --user=$(id -u):$(id -g) \
-        --env="DISPLAY=host.docker.internal:0" \
-        --volume="/tmp/.X11-unix:/tmp/.X11-unix:rw" \
-        --volume="$PWD/my_code:/ros2_ws/src/my_code" \
-        --network host \
-        --name my_ros2_container \
-        ros2_lab_env
-4) From zsh:
-    nano ~/.zshrc
-5) Add to the bottom:
-    alias ros-start='xhost + 127.0.0.1 && docker start my_ros2_container && docker exec -it my_ros2_container bash'
-6) source ~/.zshrc
+### Step B: Build the Image
+From the root `ROBOBALL/` directory on your Mac, build the image:
+```bash
+docker build --platform linux/arm64 -t ros2_web_env .
+```
 
-To run:
-1) ros-start
+---
 
-Run all ros2 commands in the docker!
+## 🏃 2. Running the Environment
+
+### Manual Start
+Run the following to start the container and link your code. This uses a volume mount, so edits on your Mac reflect instantly in the simulator.
+```bash
+docker run -it --rm \
+    --name roboball_sim \
+    -p 8080:8080 \
+    --volume="$PWD/src:/ros2_ws/src" \
+    --shm-size=1g \
+    ros2_web_env
+```
+
+### Accessing the Desktop
+1. Open your browser to: `http://localhost:8080/vnc.html`
+2. Click **Connect**.
+3. You now have a full Ubuntu desktop. The terminal is the `$_` icon in the bottom dock.
+
+---
+
+## 🏗 3. Development Workflow (Inside VNC)
+
+### The "Golden Build" Sequence
+Always build in this order to ensure your custom messages in `roboball_msgs` are correctly linked to your planning and perception nodes:
+```bash
+cd /ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install
+source install/setup.bash
+```
+
+### Launching Simulation
+To start Gazebo (Ignition Fortress) and the ROS-GZ Bridge simultaneously:
+```bash
+ros2 launch roboball_bringup sim.launch.py
+```
+
+### Manual Gazebo Launch (Troubleshooting)
+If the launch file is not used, run Gazebo directly using the Ignition command:
+```bash
+ign gazebo ~/ros2_ws/src/simulation/worlds/world.sdf
+```
+
+---
+
+## 🎹 Hotkey Cheat Sheet (Mac to VNC)
+
+| Action | Key Combination |
+| :--- | :--- |
+| **Paste into Terminal** | `Ctrl + Shift + V` |
+| **Copy from Terminal** | `Ctrl + Shift + C` |
+| **Interrupt/Stop Node** | `Ctrl + C` |
+| **Delete Line** | `Ctrl + U` |
+| **Bridge Mac Clipboard** | Use the grey arrow on the left of the browser window |
+
+---
+
+## ⚡ 4. Productivity Shortcuts (Mac Setup)
+Add this alias to your Mac's `~/.zshrc` to launch the environment with one command:
+```bash
+# Start the Roboball Simulation Environment
+alias robo-start='docker run -it --rm --name roboball_sim -p 8080:8080 --volume="$PWD/src:/ros2_ws/src" --shm-size=1g ros2_web_env'
+```
+*After adding, run `source ~/.zshrc`.*
+```
