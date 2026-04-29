@@ -236,11 +236,17 @@ class ArucoNode(rclpy.node.Node):
             goal_markers = []
             final_marker_ids = []
             for i, marker_id in enumerate(marker_ids):
-                marker_size = self.marker_size_map[marker_id[0]]
+                # Fall back to the configured `marker_size` param for any ID
+                # not in the hardcoded map — otherwise unknown IDs raise
+                # KeyError and silently kill the whole image_callback (no TF,
+                # no /aruco_markers, no detections downstream).
+                marker_size = self.marker_size_map.get(int(marker_id[0]), self.marker_size)
                 if marker_size == 0.05:
                     turtlebot_corners.append(corners[i])
                     turtlebot_markers.append(marker_id)
-                elif marker_size == 0.15:
+                else:
+                    # Treat anything else (including the configured fallback,
+                    # default 0.15) as a "goal-style" larger marker.
                     goal_corners.append(corners[i])
                     goal_markers.append(marker_id)
 
