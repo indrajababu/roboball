@@ -29,10 +29,10 @@ from builtin_interfaces.msg import Duration
 from tf2_ros import Buffer, TransformListener, TransformException
 
 from roboball_msgs.msg import StrikeTarget
-from roboball_planning.strike_objectives import ObjectiveConfig, StrikeObjectivePolicy
-from roboball_planning.ik import IKPlanner
-from roboball_planning.controller import PIDJointVelocityController
-from roboball_planning.trajectories import LinearTrajectory
+from my_code.roboball_planning.roboball_planning.strike_objectives import ObjectiveConfig, StrikeObjectivePolicy
+from my_code.roboball_planning.roboball_planning.ik import IKPlanner
+from my_code.roboball_planning.roboball_planning.controller import PIDJointVelocityController
+from my_code.roboball_planning.roboball_planning.trajectories import LinearTrajectory
 
 
 JOINT_ORDER = [

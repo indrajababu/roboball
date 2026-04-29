@@ -70,3 +70,42 @@ The skeleton is in. These are the **stubs with TODOs** in the order you'll compl
 | 7 | `roboball_planning/roboball_planning/strike_planner.py` | Swap action-based execution for PID velocity loop using `LinearTrajectory` + `PIDJointVelocityController`. |
 
 Full plan: `~/.claude/plans/look-through-the-labs-swift-teacup.md`.
+
+# Simulation
+
+Install Docker (from the website) for your OS
+
+Make sure to open Docker
+
+Install xhost for your OS
+brew install --cask xquartz
+
+Open xquartz, go to Settings > Security > Check "Allow Connections with Clients"
+
+docker build -t ros2_lab_env .
+
+if M4 chip:
+docker build --platform linux/arm64 -t ros2_lab_env .
+
+To set up:
+1) Make sure that docker is open
+2) xhost + 127.0.0.1
+3) First time setup:
+    docker run -it \
+        --user=$(id -u):$(id -g) \
+        --env="DISPLAY=host.docker.internal:0" \
+        --volume="/tmp/.X11-unix:/tmp/.X11-unix:rw" \
+        --volume="$PWD/my_code:/ros2_ws/src/my_code" \
+        --network host \
+        --name my_ros2_container \
+        ros2_lab_env
+4) From zsh:
+    nano ~/.zshrc
+5) Add to the bottom:
+    alias ros-start='xhost + 127.0.0.1 && docker start my_ros2_container && docker exec -it my_ros2_container bash'
+6) source ~/.zshrc
+
+To run:
+1) ros-start
+
+Run all ros2 commands in the docker!

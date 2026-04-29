@@ -29,7 +29,7 @@ import sys
 import cv2
 import numpy as np
 
-from roboball_perception.hsv_filter import HSVRange, hsv_mask_from_packed_rgb
+from my_code.roboball_perception.roboball_perception.hsv_filter import HSVRange, hsv_mask_from_packed_rgb
 
 # ROS-only imports are deferred so this file can be run as a tuner on a
 # laptop without ROS installed (`python3 ball_detector.py --tune ...`).

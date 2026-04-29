@@ -1,0 +1,19 @@
+<sdf version="1.7">
+  <world name="default">
+    <plugin filename="libgz-sim-physics-system.so" name="gz::sim::systems::Physics" />
+    <plugin filename="libgz-sim-user-commands-system.so" name="gz::sim::systems::UserCommands" />
+    <plugin filename="libgz-sim-scene-broadcaster-system.so" name="gz::sim::systems::SceneBroadcaster" />
+
+    <!-- No more includes for external models -->
+
+    <model name="ball">
+      <pose>0 0 1 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry><sphere><radius>0.1</radius></sphere></geometry>
+          <material><ambient>1 0 0 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>
