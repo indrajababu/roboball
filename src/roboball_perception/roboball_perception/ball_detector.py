@@ -1,55 +1,43 @@
 """
-Ball detector — seeded from lab5/perception/process_pointcloud.py.
+YOLO-based ball detector.
 
 Pipeline:
-  1. Subscribe to RealSense depth point cloud.
-  2. Transform the cloud into `target_frame` (default `base_link`).
-  3. Filter by a workspace bounding box AND by color (HSV mask applied to
-     each point's `rgb` field — RealSense already aligns color to depth).
-  4. Publish the centroid of the surviving points as `/ball_pose` (PointStamped)
-     and the filtered cloud as `/filtered_points` for RViz debug.
+  1. Subscribe to the aligned RGB image, the aligned depth image, and camera_info.
+  2. Run YOLOv8n on each RGB frame, filter for `target_class` (default 32 = COCO
+     "sports ball") above `conf_threshold`.
+  3. Pick the highest-confidence detection. Sample depth at the bbox center
+     (median over an NxN patch for robustness) to recover z.
+  4. Back-project (u, v, z) to a 3D point in `camera_color_optical_frame`
+     using the camera intrinsics, then transform to `target_frame`
+     (default `base_link`) via TF.
+  5. Publish PointStamped on `/ball_pose` and an annotated debug image on
+     `/ball_detector/debug_image`.
 
-Disable the color stage with `enable_hsv:=false` to fall back to the pure
-geometric filter (useful while validating the TF + workspace box).
-
-Tune HSV bounds — three options:
-  Live, against the lab RealSense (run inside the distrobox while the camera
-  is publishing):
-    ros2 run roboball_perception ball_detector --tune \
-        --topic /camera/camera/color/image_raw
-  Offline, on a laptop (no ROS):
-    python3 ball_detector.py --tune --camera 0
-    python3 ball_detector.py --tune --image ball.jpg
-  On a running detector node, push values directly:
-    ros2 param set /ball_detector hsv_lower1 '[h, s, v]'
+Required RealSense launch args:
+  pointcloud.enable:=true            (kept for downstream consumers)
+  align_depth.enable:=true           (this node's depth source)
+  rgb_camera.color_profile:=1920x1080x30
 """
 
-import sys
+from pathlib import Path
 
 import cv2
 import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PointStamped
+from cv_bridge import CvBridge
+from tf2_ros import Buffer, TransformListener, TransformException
+from tf2_geometry_msgs import do_transform_point
 
-from roboball_perception.hsv_filter import HSVRange, hsv_mask_from_packed_rgb
+from ultralytics import YOLO
 
-# ROS-only imports are deferred so this file can be run as a tuner on a
-# laptop without ROS installed (`python3 ball_detector.py --tune ...`).
-try:
-    import rclpy
-    from rclpy.node import Node
-    from rclpy.parameter import Parameter
-    from rclpy.qos import qos_profile_sensor_data
-    from rclpy.time import Time
-    from rcl_interfaces.msg import SetParametersResult
-    from sensor_msgs.msg import Image, PointCloud2
-    from geometry_msgs.msg import PointStamped
-    from cv_bridge import CvBridge
-    import sensor_msgs_py.point_cloud2 as pc2
-    from tf2_ros import Buffer, TransformListener, TransformException
-    from tf2_sensor_msgs.tf2_sensor_msgs import do_transform_cloud
-    _HAVE_ROS = True
-except ImportError:
-    _HAVE_ROS = False
-    Node = object  # so the class definition below still parses
+
+COCO_SPORTS_BALL = 32
+DEFAULT_MODEL_PATH = str(Path.home() / '.cache' / 'ultralytics' / 'yolov8n.pt')
 
 
 class BallDetector(Node):
@@ -57,318 +45,239 @@ class BallDetector(Node):
         super().__init__('ball_detector')
 
         self.target_frame = self.declare_parameter('target_frame', 'base_link').value
-        self.source_frame = self.declare_parameter('source_frame', 'camera_depth_optical_frame').value
+        self.camera_frame = self.declare_parameter(
+            'camera_frame', 'camera_color_optical_frame'
+        ).value
 
-        # Workspace bounding box (in target_frame). Tune in RViz with
-        # `ros2 param set /ball_detector <name> <value>`.
-        self.min_x = float(self.declare_parameter('min_x', -0.80).value)
-        self.max_x = float(self.declare_parameter('max_x',  0.80).value)
-        self.min_y = float(self.declare_parameter('min_y', -0.80).value)
-        self.max_y = float(self.declare_parameter('max_y',  0.80).value)
-        self.min_z = float(self.declare_parameter('min_z',  0.00).value)
-        self.max_z = float(self.declare_parameter('max_z',  2.00).value)
+        model_path = self.declare_parameter('model_path', DEFAULT_MODEL_PATH).value
+        self.conf_threshold = float(self.declare_parameter('conf_threshold', 0.30).value)
+        self.imgsz = int(self.declare_parameter('imgsz', 640).value)
+        self.target_class = int(self.declare_parameter('target_class', COCO_SPORTS_BALL).value)
+        device_param = str(self.declare_parameter('device', 'auto').value)
+        self.device = self._resolve_device(device_param)
 
-        # HSV color filter. Defaults are tuned for a yellow ball; re-tune
-        # with `ball_detector --tune --topic ...` against the actual beach
-        # ball + lighting. Set hsv_upper2 to all-zeros to disable the second
-        # range (red wraps H=0/180, so red balls need both).
-        self.enable_hsv = bool(self.declare_parameter('enable_hsv', True).value)
-        self.hsv_lower1 = list(self.declare_parameter('hsv_lower1', [0, 120, 80]).value)
-        self.hsv_upper1 = list(self.declare_parameter('hsv_upper1', [12, 255, 255]).value)
-        self.hsv_lower2 = list(self.declare_parameter('hsv_lower2', [0, 0, 0]).value)
-        self.hsv_upper2 = list(self.declare_parameter('hsv_upper2', [0, 0, 0]).value)
-        self.min_color_points = int(self.declare_parameter('min_color_points', 20).value)
+        self.min_x = float(self.declare_parameter('min_x', -1.5).value)
+        self.max_x = float(self.declare_parameter('max_x',  1.5).value)
+        self.min_y = float(self.declare_parameter('min_y', -1.5).value)
+        self.max_y = float(self.declare_parameter('max_y',  1.5).value)
+        self.min_z = float(self.declare_parameter('min_z',  0.0).value)
+        self.max_z = float(self.declare_parameter('max_z',  3.0).value)
 
-        self.add_on_set_parameters_callback(self._on_parameter_update)
+        self.depth_patch = int(self.declare_parameter('depth_patch', 5).value)
+        self.min_depth_m = float(self.declare_parameter('min_depth_m', 0.20).value)
+        self.max_depth_m = float(self.declare_parameter('max_depth_m', 4.00).value)
+
+        self.publish_debug = bool(self.declare_parameter('publish_debug', True).value)
+
+        self.bridge = CvBridge()
+        self.latest_depth: np.ndarray | None = None
+        self.K: np.ndarray | None = None
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self.pc_sub = self.create_subscription(
-            PointCloud2,
-            '/camera/camera/depth/color/points',
-            self.pointcloud_callback,
+        self.get_logger().info(f'Loading YOLO from {model_path} on {self.device}...')
+        self.model = YOLO(model_path)
+        # One warm-up inference so the first real frame doesn't pay the JIT cost.
+        _ = self.model.predict(
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            conf=self.conf_threshold,
+            classes=[self.target_class],
+            imgsz=self.imgsz,
+            device=self.device,
+            verbose=False,
+        )
+        self.get_logger().info('YOLO ready.')
+
+        self.create_subscription(
+            CameraInfo,
+            '/camera/camera/color/camera_info',
+            self._on_camera_info,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            Image,
+            '/camera/camera/aligned_depth_to_color/image_raw',
+            self._on_depth,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            Image,
+            '/camera/camera/color/image_raw',
+            self._on_color,
             qos_profile_sensor_data,
         )
 
         self.ball_pose_pub = self.create_publisher(PointStamped, '/ball_pose', 1)
-        self.filtered_points_pub = self.create_publisher(PointCloud2, '/filtered_points', 1)
+        self.debug_pub = self.create_publisher(Image, '/ball_detector/debug_image', 1)
 
         self.get_logger().info(
-            f'Ball detector up. Target frame: {self.target_frame}. '
-            f'Workspace box x=[{self.min_x},{self.max_x}], '
-            f'y=[{self.min_y},{self.max_y}], z=[{self.min_z},{self.max_z}]. '
-            f'HSV {"ON" if self.enable_hsv else "OFF"}: '
-            f'lower1={self.hsv_lower1} upper1={self.hsv_upper1}'
+            f'Ball detector (YOLO) up. target_frame={self.target_frame}, '
+            f'class={self.target_class}, conf>={self.conf_threshold}, '
+            f'imgsz={self.imgsz}, device={self.device}.'
         )
 
-    def _hsv_ranges(self) -> list[HSVRange]:
-        ranges = [HSVRange(self.hsv_lower1, self.hsv_upper1)]
-        if any(v > 0 for v in self.hsv_upper2):
-            ranges.append(HSVRange(self.hsv_lower2, self.hsv_upper2))
-        return ranges
-
-    def pointcloud_callback(self, msg: 'PointCloud2'):
+    @staticmethod
+    def _resolve_device(device_param: str) -> str:
+        if device_param != 'auto':
+            return device_param
         try:
-            tf = self.tf_buffer.lookup_transform(self.target_frame, self.source_frame, Time())
+            import torch
+            return 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        except ImportError:
+            return 'cpu'
+
+    def _on_camera_info(self, msg: CameraInfo):
+        if self.K is not None:
+            return
+        self.K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        self.get_logger().info(
+            f'Camera intrinsics: fx={self.K[0,0]:.2f}, fy={self.K[1,1]:.2f}, '
+            f'cx={self.K[0,2]:.2f}, cy={self.K[1,2]:.2f}, frame={msg.header.frame_id}'
+        )
+
+    def _on_depth(self, msg: Image):
+        try:
+            self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        except Exception as e:
+            self.get_logger().warn(f'depth bridge failed: {e}', throttle_duration_sec=2.0)
+
+    def _on_color(self, msg: Image):
+        if self.K is None:
+            self.get_logger().warn(
+                'Waiting for /camera/camera/color/camera_info...',
+                throttle_duration_sec=2.0,
+            )
+            return
+        if self.latest_depth is None:
+            self.get_logger().warn(
+                'Waiting for /camera/camera/aligned_depth_to_color/image_raw — '
+                'is align_depth.enable:=true set on rs_launch?',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().warn(f'color bridge failed: {e}', throttle_duration_sec=2.0)
+            return
+
+        result = self.model.predict(
+            frame,
+            conf=self.conf_threshold,
+            classes=[self.target_class],
+            imgsz=self.imgsz,
+            device=self.device,
+            verbose=False,
+        )[0]
+
+        boxes = result.boxes
+        if boxes is None or len(boxes) == 0:
+            if self.publish_debug:
+                self._publish_debug(frame, None)
+            return
+
+        idx = int(np.argmax(boxes.conf.cpu().numpy()))
+        x1, y1, x2, y2 = boxes.xyxy[idx].cpu().numpy().tolist()
+        conf = float(boxes.conf[idx].cpu().numpy())
+        u = int(round((x1 + x2) * 0.5))
+        v = int(round((y1 + y2) * 0.5))
+
+        z_m = self._depth_at(u, v)
+        if z_m is None:
+            self.get_logger().warn(
+                f'No valid depth at bbox center ({u},{v}).',
+                throttle_duration_sec=2.0,
+            )
+            if self.publish_debug:
+                self._publish_debug(frame, ((x1, y1, x2, y2), conf, None))
+            return
+
+        fx, fy = self.K[0, 0], self.K[1, 1]
+        cx, cy = self.K[0, 2], self.K[1, 2]
+        x_cam = (u - cx) * z_m / fx
+        y_cam = (v - cy) * z_m / fy
+
+        ball_in_cam = PointStamped()
+        ball_in_cam.header.stamp = msg.header.stamp
+        ball_in_cam.header.frame_id = self.camera_frame
+        ball_in_cam.point.x = float(x_cam)
+        ball_in_cam.point.y = float(y_cam)
+        ball_in_cam.point.z = float(z_m)
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.target_frame, self.camera_frame, Time()
+            )
         except TransformException as ex:
             self.get_logger().warn(
-                f'Could not transform {self.source_frame} to {self.target_frame}: {ex}',
+                f'Could not transform {self.camera_frame} -> {self.target_frame}: {ex}',
                 throttle_duration_sec=2.0,
             )
             return
 
-        transformed_cloud = do_transform_cloud(msg, tf)
+        ball_in_target = do_transform_point(ball_in_cam, tf)
+        p = ball_in_target.point
 
-        # Read xyz always; rgb only if HSV is enabled (avoids the per-point
-        # decode cost when the team has the color stage off).
-        if self.enable_hsv:
-            field_names = ('x', 'y', 'z', 'rgb')
-        else:
-            field_names = ('x', 'y', 'z')
-
-        try:
-            raw = pc2.read_points(transformed_cloud, field_names=field_names, skip_nans=True)
-        except (ValueError, AssertionError) as ex:
-            # Some RealSense configs publish without an `rgb` field. Fall back
-            # to xyz-only on the next frame.
-            if self.enable_hsv:
-                self.get_logger().warn(
-                    f'Cloud has no rgb field ({ex}); disabling HSV stage.',
-                    throttle_duration_sec=5.0,
-                )
-                self.enable_hsv = False
-                return
-            raise
-
-        points = np.column_stack(
-            (raw['x'], raw['y'], raw['z'])
-        ).astype(np.float32, copy=False)
-
-        # Workspace box filter.
-        mask = (
-            (points[:, 0] >= self.min_x) & (points[:, 0] <= self.max_x)
-            & (points[:, 1] >= self.min_y) & (points[:, 1] <= self.max_y)
-            & (points[:, 2] >= self.min_z) & (points[:, 2] <= self.max_z)
-        )
-
-        # HSV color filter, AND'd with the box.
-        if self.enable_hsv:
-            color_mask = hsv_mask_from_packed_rgb(raw['rgb'], self._hsv_ranges())
-            mask &= color_mask
-
-        filtered = points[mask]
-
-        if filtered.size == 0:
+        if not (self.min_x <= p.x <= self.max_x
+                and self.min_y <= p.y <= self.max_y
+                and self.min_z <= p.z <= self.max_z):
             self.get_logger().warn(
-                'No points survived box+HSV filters — check TF, box, and HSV params.',
+                f'Ball at ({p.x:.2f},{p.y:.2f},{p.z:.2f}) outside workspace box; rejecting.',
                 throttle_duration_sec=2.0,
             )
+            if self.publish_debug:
+                self._publish_debug(frame, ((x1, y1, x2, y2), conf, None))
             return
 
-        if self.enable_hsv and filtered.shape[0] < self.min_color_points:
-            self.get_logger().warn(
-                f'Only {filtered.shape[0]} color-matching points (< {self.min_color_points}); '
-                'likely a false positive — skipping this frame.',
-                throttle_duration_sec=2.0,
-            )
-            return
+        ball_in_target.header.stamp = self.get_clock().now().to_msg()
+        self.ball_pose_pub.publish(ball_in_target)
 
-        filtered_cloud = pc2.create_cloud_xyz32(
-            transformed_cloud.header,
-            filtered.tolist(),
-        )
-        self.filtered_points_pub.publish(filtered_cloud)
+        if self.publish_debug:
+            self._publish_debug(frame, ((x1, y1, x2, y2), conf, (p.x, p.y, p.z)))
 
-        centroid = np.mean(filtered, axis=0)
+    def _depth_at(self, u: int, v: int) -> float | None:
+        d = self.latest_depth
+        if d is None:
+            return None
+        h, w = d.shape[:2]
+        if not (0 <= u < w and 0 <= v < h):
+            return None
+        half = max(0, self.depth_patch // 2)
+        u0, u1 = max(0, u - half), min(w, u + half + 1)
+        v0, v1 = max(0, v - half), min(h, v + half + 1)
+        patch = d[v0:v1, u0:u1]
+        valid = patch[patch > 0]
+        if valid.size == 0:
+            return None
+        # RealSense aligned depth is uint16 millimeters.
+        z_m = float(np.median(valid.astype(np.float32))) * 0.001
+        if not (self.min_depth_m <= z_m <= self.max_depth_m):
+            return None
+        return z_m
 
-        ball_pose = PointStamped()
-        ball_pose.header.stamp = self.get_clock().now().to_msg()
-        ball_pose.header.frame_id = self.target_frame
-        ball_pose.point.x = float(centroid[0])
-        ball_pose.point.y = float(centroid[1])
-        ball_pose.point.z = float(centroid[2])
-        self.ball_pose_pub.publish(ball_pose)
-
-    def _on_parameter_update(self, params):
-        bounds = {
-            'min_x': self.min_x, 'max_x': self.max_x,
-            'min_y': self.min_y, 'max_y': self.max_y,
-            'min_z': self.min_z, 'max_z': self.max_z,
-        }
-        hsv_arrays = {
-            'hsv_lower1': self.hsv_lower1, 'hsv_upper1': self.hsv_upper1,
-            'hsv_lower2': self.hsv_lower2, 'hsv_upper2': self.hsv_upper2,
-        }
-        new_enable_hsv = self.enable_hsv
-        new_min_color_points = self.min_color_points
-
-        for p in params:
-            if p.name in bounds and p.type_ == Parameter.Type.DOUBLE:
-                bounds[p.name] = float(p.value)
-            elif p.name in hsv_arrays and p.type_ == Parameter.Type.INTEGER_ARRAY:
-                vals = list(p.value)
-                if len(vals) != 3 or any(v < 0 or v > 255 for v in vals):
-                    return SetParametersResult(
-                        successful=False,
-                        reason=f'{p.name} must be a 3-element array with values in [0, 255]',
-                    )
-                hsv_arrays[p.name] = vals
-            elif p.name == 'enable_hsv' and p.type_ == Parameter.Type.BOOL:
-                new_enable_hsv = bool(p.value)
-            elif p.name == 'min_color_points' and p.type_ == Parameter.Type.INTEGER:
-                new_min_color_points = int(p.value)
-
-        if bounds['min_x'] > bounds['max_x'] \
-                or bounds['min_y'] > bounds['max_y'] \
-                or bounds['min_z'] > bounds['max_z']:
-            return SetParametersResult(successful=False, reason='min_* must be <= max_*')
-
-        self.min_x, self.max_x = bounds['min_x'], bounds['max_x']
-        self.min_y, self.max_y = bounds['min_y'], bounds['max_y']
-        self.min_z, self.max_z = bounds['min_z'], bounds['max_z']
-        self.hsv_lower1 = hsv_arrays['hsv_lower1']
-        self.hsv_upper1 = hsv_arrays['hsv_upper1']
-        self.hsv_lower2 = hsv_arrays['hsv_lower2']
-        self.hsv_upper2 = hsv_arrays['hsv_upper2']
-        self.enable_hsv = new_enable_hsv
-        self.min_color_points = new_min_color_points
-        return SetParametersResult(successful=True)
-
-
-_TUNER_TRACKBARS = [('H lo', 0, 179), ('H hi', 179, 179),
-                    ('S lo', 0, 255), ('S hi', 255, 255),
-                    ('V lo', 0, 255), ('V hi', 255, 255)]
-
-
-def _make_tuner_window() -> str:
-    win = 'hsv_tuner'
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    for name, init, maxval in _TUNER_TRACKBARS:
-        cv2.createTrackbar(name, win, init, maxval, lambda _x: None)
-    return win
-
-
-def _render_tuner_frame(win: str, frame: np.ndarray) -> int:
-    """Read trackbars, draw mask preview, handle keys. Returns the cv2 keycode."""
-    vals = [cv2.getTrackbarPos(n, win) for n, _, _ in _TUNER_TRACKBARS]
-    lower = np.array([vals[0], vals[2], vals[4]], dtype=np.uint8)
-    upper = np.array([vals[1], vals[3], vals[5]], dtype=np.uint8)
-
-    hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (5, 5), 0), cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, lower, upper)
-    masked = cv2.bitwise_and(frame, frame, mask=mask)
-    view = np.hstack([frame, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), masked])
-    h, w = view.shape[:2]
-    if w > 1280:
-        view = cv2.resize(view, (1280, int(h * 1280 / w)))
-
-    cv2.imshow(win, view)
-    key = cv2.waitKey(30) & 0xFF
-    if key == ord('s'):
-        lo, hi = [int(x) for x in lower], [int(x) for x in upper]
-        print(f"\nros2 param set /ball_detector hsv_lower1 '{lo}'")
-        print(f"ros2 param set /ball_detector hsv_upper1 '{hi}'\n")
-    return key
-
-
-def _run_tuner_local(camera: int | None, image_path: str | None) -> int:
-    """Tune against a webcam or a still image. No ROS needed."""
-    if image_path is not None:
-        frame_static = cv2.imread(image_path)
-        if frame_static is None:
-            print(f'could not read {image_path}', file=sys.stderr)
-            return 1
-        cap = None
-    else:
-        cap = cv2.VideoCapture(camera)
-        if not cap.isOpened():
-            print(f'could not open camera {camera}', file=sys.stderr)
-            return 1
-        frame_static = None
-
-    win = _make_tuner_window()
-    while True:
-        if cap is not None:
-            ok, frame = cap.read()
-            if not ok:
-                break
+    def _publish_debug(self, frame: np.ndarray, det):
+        if det is None:
+            label = 'no detection'
         else:
-            frame = frame_static.copy()
-
-        key = _render_tuner_frame(win, frame)
-        if key in (ord('q'), 27):
-            break
-
-    if cap is not None:
-        cap.release()
-    cv2.destroyAllWindows()
-    return 0
-
-
-def _run_tuner_ros(topic: str) -> int:
-    """Tune against a live ROS Image topic (e.g. the lab RealSense)."""
-    if not _HAVE_ROS:
-        print('rclpy not available — cannot use --topic.', file=sys.stderr)
-        return 1
-
-    rclpy.init()
-    node = rclpy.create_node('hsv_tuner')
-    bridge = CvBridge()
-    latest: dict[str, np.ndarray | None] = {'frame': None}
-
-    def _cb(msg: 'Image') -> None:
+            (x1, y1, x2, y2), conf, xyz = det
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            if xyz is None:
+                label = f'ball {conf:.2f}  no depth'
+            else:
+                label = f'ball {conf:.2f}  ({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})'
+            cv2.putText(
+                frame, label, (int(x1), max(0, int(y1) - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+            )
         try:
-            latest['frame'] = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            node.get_logger().warn(f'cv_bridge failed: {e}')
-
-    node.create_subscription(Image, topic, _cb, qos_profile_sensor_data)
-    node.get_logger().info(f'hsv_tuner subscribed to {topic} — waiting for frames')
-
-    win = _make_tuner_window()
-    try:
-        while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.03)
-            if latest['frame'] is None:
-                continue
-            key = _render_tuner_frame(win, latest['frame'])
-            if key in (ord('q'), 27):
-                break
-    finally:
-        cv2.destroyAllWindows()
-        node.destroy_node()
-        rclpy.shutdown()
-    return 0
+            self.debug_pub.publish(self.bridge.cv2_to_imgmsg(frame, encoding='bgr8'))
+        except Exception:
+            pass
 
 
 def main(args=None):
-    argv = sys.argv[1:] if args is None else list(args)
-
-    if '--tune' in argv:
-        import argparse
-        # Strip the `--ros-args ...` tail that `ros2 run` appends, plus any
-        # trailing args after it. Keeps argparse from choking when launched
-        # via `ros2 run roboball_perception ball_detector --tune --topic ...`.
-        if '--ros-args' in argv:
-            argv = argv[:argv.index('--ros-args')]
-        parser = argparse.ArgumentParser(prog='ball_detector --tune')
-        parser.add_argument('--tune', action='store_true')
-        src = parser.add_mutually_exclusive_group(required=True)
-        src.add_argument('--topic', type=str,
-                         help='ROS Image topic (e.g. /camera/camera/color/image_raw)')
-        src.add_argument('--camera', type=int, help='Webcam index, e.g. 0')
-        src.add_argument('--image', type=str, help='Path to a still image')
-        ns = parser.parse_args(argv)
-        if ns.topic is not None:
-            sys.exit(_run_tuner_ros(ns.topic))
-        sys.exit(_run_tuner_local(ns.camera, ns.image))
-
-    if not _HAVE_ROS:
-        print('rclpy not available — only --tune mode works without ROS.',
-              file=sys.stderr)
-        sys.exit(1)
-
     rclpy.init(args=args)
     node = BallDetector()
     try:

@@ -13,6 +13,7 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>tf2_sensor_msgs</exec_depend>
   <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>roboball_msgs</exec_depend>

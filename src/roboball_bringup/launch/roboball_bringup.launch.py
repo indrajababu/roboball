@@ -39,7 +39,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     ur_type = LaunchConfiguration('ur_type', default='ur7e')
     launch_rviz = LaunchConfiguration('launch_rviz', default='true')
-    marker_number = LaunchConfiguration('marker_number', default='10')
+    marker_number = LaunchConfiguration('marker_number', default='-1')
 
     realsense_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -52,6 +52,7 @@ def generate_launch_description():
         launch_arguments={
             'serial_no': "'843112070166'",
             'pointcloud.enable': 'true',
+            'align_depth.enable': 'true',
             'rgb_camera.color_profile': '1920x1080x30',
         }.items(),
     )
@@ -131,7 +132,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('ur_type', default_value='ur7e'),
         DeclareLaunchArgument('launch_rviz', default_value='true'),
-        DeclareLaunchArgument('marker_number', default_value='10'),
+        DeclareLaunchArgument('marker_number', default_value='-1'),
         realsense_launch,
         moveit_launch,
         aruco_node,
