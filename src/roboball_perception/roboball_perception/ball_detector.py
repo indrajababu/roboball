@@ -1,43 +1,38 @@
 """
-YOLO-based ball detector.
+Ball detector — YOLO variant (yolo branch).
 
 Pipeline:
-  1. Subscribe to the aligned RGB image, the aligned depth image, and camera_info.
-  2. Run YOLOv8n on each RGB frame, filter for `target_class` (default 32 = COCO
-     "sports ball") above `conf_threshold`.
-  3. Pick the highest-confidence detection. Sample depth at the bbox center
-     (median over an NxN patch for robustness) to recover z.
-  4. Back-project (u, v, z) to a 3D point in `camera_color_optical_frame`
-     using the camera intrinsics, then transform to `target_frame`
-     (default `base_link`) via TF.
-  5. Publish PointStamped on `/ball_pose` and an annotated debug image on
-     `/ball_detector/debug_image`.
+  1. Cache latest RealSense color image + color camera intrinsics.
+  2. On each depth+color point cloud, run YOLOv8n on the cached color image.
+     Filter detections to a single COCO class (default 32 = sports ball).
+  3. Project every cloud point into the color image plane using the color
+     intrinsics. Keep only points whose pixels fall inside any detection bbox.
+  4. AND with the workspace bounding box in `target_frame` (default `base_link`)
+     as a safety filter, then publish the centroid as `/ball_pose` and the
+     surviving points as `/filtered_points`.
 
-Required RealSense launch args:
-  pointcloud.enable:=true            (kept for downstream consumers)
-  align_depth.enable:=true           (this node's depth source)
-  rgb_camera.color_profile:=1920x1080x30
+Weights auto-download to ~/.config/Ultralytics on first run.
+Dependency (one-time, inside the distrobox): `pip install ultralytics`.
 """
 
-from pathlib import Path
-
-import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import Image, CameraInfo
+from rcl_interfaces.msg import SetParametersResult
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from geometry_msgs.msg import PointStamped
+from std_msgs.msg import Header
 from cv_bridge import CvBridge
+import sensor_msgs_py.point_cloud2 as pc2
 from tf2_ros import Buffer, TransformListener, TransformException
-from tf2_geometry_msgs import do_transform_point
-
+from scipy.spatial.transform import Rotation as R
 from ultralytics import YOLO
 
 
-COCO_SPORTS_BALL = 32
-DEFAULT_MODEL_PATH = str(Path.home() / '.cache' / 'ultralytics' / 'yolov8n.pt')
+SPORTS_BALL_CLASS_ID = 32  # COCO
 
 
 class BallDetector(Node):
@@ -45,236 +40,207 @@ class BallDetector(Node):
         super().__init__('ball_detector')
 
         self.target_frame = self.declare_parameter('target_frame', 'base_link').value
-        self.camera_frame = self.declare_parameter(
-            'camera_frame', 'camera_color_optical_frame'
-        ).value
+        self.color_frame = self.declare_parameter('color_frame', 'camera_color_optical_frame').value
 
-        model_path = self.declare_parameter('model_path', DEFAULT_MODEL_PATH).value
-        self.conf_threshold = float(self.declare_parameter('conf_threshold', 0.30).value)
-        self.imgsz = int(self.declare_parameter('imgsz', 640).value)
-        self.target_class = int(self.declare_parameter('target_class', COCO_SPORTS_BALL).value)
-        device_param = str(self.declare_parameter('device', 'auto').value)
-        self.device = self._resolve_device(device_param)
+        self.min_x = float(self.declare_parameter('min_x', -0.80).value)
+        self.max_x = float(self.declare_parameter('max_x',  0.80).value)
+        self.min_y = float(self.declare_parameter('min_y', -0.80).value)
+        self.max_y = float(self.declare_parameter('max_y',  0.80).value)
+        self.min_z = float(self.declare_parameter('min_z',  0.00).value)
+        self.max_z = float(self.declare_parameter('max_z',  2.00).value)
 
-        self.min_x = float(self.declare_parameter('min_x', -1.5).value)
-        self.max_x = float(self.declare_parameter('max_x',  1.5).value)
-        self.min_y = float(self.declare_parameter('min_y', -1.5).value)
-        self.max_y = float(self.declare_parameter('max_y',  1.5).value)
-        self.min_z = float(self.declare_parameter('min_z',  0.0).value)
-        self.max_z = float(self.declare_parameter('max_z',  3.0).value)
+        weights = str(self.declare_parameter('yolo_weights', 'yolov8n.pt').value)
+        self.conf_thresh = float(self.declare_parameter('yolo_conf', 0.25).value)
+        self.class_id = int(self.declare_parameter('yolo_class', SPORTS_BALL_CLASS_ID).value)
+        self.min_inliers = int(self.declare_parameter('min_inliers', 20).value)
 
-        self.depth_patch = int(self.declare_parameter('depth_patch', 5).value)
-        self.min_depth_m = float(self.declare_parameter('min_depth_m', 0.20).value)
-        self.max_depth_m = float(self.declare_parameter('max_depth_m', 4.00).value)
+        self.add_on_set_parameters_callback(self._on_parameter_update)
 
-        self.publish_debug = bool(self.declare_parameter('publish_debug', True).value)
-
+        self.get_logger().info(f'Loading YOLO weights: {weights}')
+        self.model = YOLO(weights)
         self.bridge = CvBridge()
-        self.latest_depth: np.ndarray | None = None
-        self.K: np.ndarray | None = None
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self.get_logger().info(f'Loading YOLO from {model_path} on {self.device}...')
-        self.model = YOLO(model_path)
-        # One warm-up inference so the first real frame doesn't pay the JIT cost.
-        _ = self.model.predict(
-            np.zeros((480, 640, 3), dtype=np.uint8),
-            conf=self.conf_threshold,
-            classes=[self.target_class],
-            imgsz=self.imgsz,
-            device=self.device,
-            verbose=False,
-        )
-        self.get_logger().info('YOLO ready.')
+        self.latest_bgr = None
+        self.color_K = None
+        self.image_w = 0
+        self.image_h = 0
 
-        self.create_subscription(
-            CameraInfo,
-            '/camera/camera/color/camera_info',
-            self._on_camera_info,
-            qos_profile_sensor_data,
-        )
-        self.create_subscription(
-            Image,
-            '/camera/camera/aligned_depth_to_color/image_raw',
-            self._on_depth,
-            qos_profile_sensor_data,
-        )
-        self.create_subscription(
-            Image,
-            '/camera/camera/color/image_raw',
-            self._on_color,
-            qos_profile_sensor_data,
-        )
+        self.create_subscription(Image, '/camera/camera/color/image_raw',
+                                 self._on_image, qos_profile_sensor_data)
+        self.create_subscription(CameraInfo, '/camera/camera/color/camera_info',
+                                 self._on_camera_info, 10)
+        self.create_subscription(PointCloud2, '/camera/camera/depth/color/points',
+                                 self._on_pointcloud, 10)
 
         self.ball_pose_pub = self.create_publisher(PointStamped, '/ball_pose', 1)
-        self.debug_pub = self.create_publisher(Image, '/ball_detector/debug_image', 1)
+        self.filtered_points_pub = self.create_publisher(PointCloud2, '/filtered_points', 1)
 
         self.get_logger().info(
-            f'Ball detector (YOLO) up. target_frame={self.target_frame}, '
-            f'class={self.target_class}, conf>={self.conf_threshold}, '
-            f'imgsz={self.imgsz}, device={self.device}.'
+            f'YOLO ball detector up. target={self.target_frame}, color={self.color_frame}, '
+            f'class={self.class_id}, conf>={self.conf_thresh}, min_inliers={self.min_inliers}, '
+            f'workspace x=[{self.min_x},{self.max_x}] y=[{self.min_y},{self.max_y}] '
+            f'z=[{self.min_z},{self.max_z}].'
         )
 
-    @staticmethod
-    def _resolve_device(device_param: str) -> str:
-        if device_param != 'auto':
-            return device_param
-        try:
-            import torch
-            return 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        except ImportError:
-            return 'cpu'
+    # --------------------------------------------------------- subscriptions
 
     def _on_camera_info(self, msg: CameraInfo):
-        if self.K is not None:
-            return
-        self.K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
-        self.get_logger().info(
-            f'Camera intrinsics: fx={self.K[0,0]:.2f}, fy={self.K[1,1]:.2f}, '
-            f'cx={self.K[0,2]:.2f}, cy={self.K[1,2]:.2f}, frame={msg.header.frame_id}'
-        )
+        if self.color_K is None:
+            self.color_K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+            self.image_w = int(msg.width)
+            self.image_h = int(msg.height)
+            self.get_logger().info(
+                f'Color intrinsics ready: {self.image_w}x{self.image_h}, '
+                f'fx={self.color_K[0,0]:.1f} fy={self.color_K[1,1]:.1f}'
+            )
 
-    def _on_depth(self, msg: Image):
+    def _on_image(self, msg: Image):
         try:
-            self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        except Exception as e:
-            self.get_logger().warn(f'depth bridge failed: {e}', throttle_duration_sec=2.0)
+            self.latest_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as ex:
+            self.get_logger().warn(f'cv_bridge failed: {ex}', throttle_duration_sec=5.0)
 
-    def _on_color(self, msg: Image):
-        if self.K is None:
+    def _on_pointcloud(self, msg: PointCloud2):
+        if self.latest_bgr is None:
+            self.get_logger().warn('No color image yet.', throttle_duration_sec=2.0)
+            return
+        if self.color_K is None:
+            self.get_logger().warn('No camera_info yet.', throttle_duration_sec=2.0)
+            return
+
+        bboxes = self._detect_bboxes(self.latest_bgr)
+        if not bboxes:
             self.get_logger().warn(
-                'Waiting for /camera/camera/color/camera_info...',
+                f'YOLO: no class-{self.class_id} detections.',
                 throttle_duration_sec=2.0,
             )
             return
-        if self.latest_depth is None:
-            self.get_logger().warn(
-                'Waiting for /camera/camera/aligned_depth_to_color/image_raw — '
-                'is align_depth.enable:=true set on rs_launch?',
-                throttle_duration_sec=2.0,
-            )
-            return
 
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            self.get_logger().warn(f'color bridge failed: {e}', throttle_duration_sec=2.0)
-            return
-
-        result = self.model.predict(
-            frame,
-            conf=self.conf_threshold,
-            classes=[self.target_class],
-            imgsz=self.imgsz,
-            device=self.device,
-            verbose=False,
-        )[0]
-
-        boxes = result.boxes
-        if boxes is None or len(boxes) == 0:
-            if self.publish_debug:
-                self._publish_debug(frame, None)
-            return
-
-        idx = int(np.argmax(boxes.conf.cpu().numpy()))
-        x1, y1, x2, y2 = boxes.xyxy[idx].cpu().numpy().tolist()
-        conf = float(boxes.conf[idx].cpu().numpy())
-        u = int(round((x1 + x2) * 0.5))
-        v = int(round((y1 + y2) * 0.5))
-
-        z_m = self._depth_at(u, v)
-        if z_m is None:
-            self.get_logger().warn(
-                f'No valid depth at bbox center ({u},{v}).',
-                throttle_duration_sec=2.0,
-            )
-            if self.publish_debug:
-                self._publish_debug(frame, ((x1, y1, x2, y2), conf, None))
-            return
-
-        fx, fy = self.K[0, 0], self.K[1, 1]
-        cx, cy = self.K[0, 2], self.K[1, 2]
-        x_cam = (u - cx) * z_m / fx
-        y_cam = (v - cy) * z_m / fy
-
-        ball_in_cam = PointStamped()
-        ball_in_cam.header.stamp = msg.header.stamp
-        ball_in_cam.header.frame_id = self.camera_frame
-        ball_in_cam.point.x = float(x_cam)
-        ball_in_cam.point.y = float(y_cam)
-        ball_in_cam.point.z = float(z_m)
-
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.target_frame, self.camera_frame, Time()
-            )
+            tf_color = self.tf_buffer.lookup_transform(
+                self.color_frame, msg.header.frame_id, Time())
+            tf_base = self.tf_buffer.lookup_transform(
+                self.target_frame, msg.header.frame_id, Time())
         except TransformException as ex:
-            self.get_logger().warn(
-                f'Could not transform {self.camera_frame} -> {self.target_frame}: {ex}',
-                throttle_duration_sec=2.0,
-            )
+            self.get_logger().warn(f'TF lookup failed: {ex}', throttle_duration_sec=2.0)
             return
 
-        ball_in_target = do_transform_point(ball_in_cam, tf)
-        p = ball_in_target.point
-
-        if not (self.min_x <= p.x <= self.max_x
-                and self.min_y <= p.y <= self.max_y
-                and self.min_z <= p.z <= self.max_z):
-            self.get_logger().warn(
-                f'Ball at ({p.x:.2f},{p.y:.2f},{p.z:.2f}) outside workspace box; rejecting.',
-                throttle_duration_sec=2.0,
-            )
-            if self.publish_debug:
-                self._publish_debug(frame, ((x1, y1, x2, y2), conf, None))
-            return
-
-        ball_in_target.header.stamp = self.get_clock().now().to_msg()
-        self.ball_pose_pub.publish(ball_in_target)
-
-        if self.publish_debug:
-            self._publish_debug(frame, ((x1, y1, x2, y2), conf, (p.x, p.y, p.z)))
-
-    def _depth_at(self, u: int, v: int) -> float | None:
-        d = self.latest_depth
-        if d is None:
-            return None
-        h, w = d.shape[:2]
-        if not (0 <= u < w and 0 <= v < h):
-            return None
-        half = max(0, self.depth_patch // 2)
-        u0, u1 = max(0, u - half), min(w, u + half + 1)
-        v0, v1 = max(0, v - half), min(h, v + half + 1)
-        patch = d[v0:v1, u0:u1]
-        valid = patch[patch > 0]
-        if valid.size == 0:
-            return None
-        # RealSense aligned depth is uint16 millimeters.
-        z_m = float(np.median(valid.astype(np.float32))) * 0.001
-        if not (self.min_depth_m <= z_m <= self.max_depth_m):
-            return None
-        return z_m
-
-    def _publish_debug(self, frame: np.ndarray, det):
-        if det is None:
-            label = 'no detection'
-        else:
-            (x1, y1, x2, y2), conf, xyz = det
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            if xyz is None:
-                label = f'ball {conf:.2f}  no depth'
-            else:
-                label = f'ball {conf:.2f}  ({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})'
-            cv2.putText(
-                frame, label, (int(x1), max(0, int(y1) - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
-            )
         try:
-            self.debug_pub.publish(self.bridge.cv2_to_imgmsg(frame, encoding='bgr8'))
-        except Exception:
-            pass
+            raw = pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
+        except Exception as ex:
+            self.get_logger().warn(f'cloud read failed: {ex}', throttle_duration_sec=5.0)
+            return
+        pts_src = np.column_stack((raw['x'], raw['y'], raw['z'])).astype(np.float64)
+        if pts_src.size == 0:
+            return
+
+        pts_color = _apply_transform(tf_color, pts_src)
+        pts_base = _apply_transform(tf_base, pts_src)
+
+        # Project into color image plane
+        z = pts_color[:, 2]
+        in_front = z > 0.0
+        u = self.color_K[0, 0] * pts_color[:, 0] / np.where(in_front, z, 1.0) + self.color_K[0, 2]
+        v = self.color_K[1, 1] * pts_color[:, 1] / np.where(in_front, z, 1.0) + self.color_K[1, 2]
+        in_image = in_front & (u >= 0) & (u < self.image_w) & (v >= 0) & (v < self.image_h)
+
+        bbox_mask = np.zeros(len(pts_src), dtype=bool)
+        for x1, y1, x2, y2 in bboxes:
+            bbox_mask |= in_image & (u >= x1) & (u <= x2) & (v >= y1) & (v <= y2)
+
+        ws_mask = (
+            (pts_base[:, 0] >= self.min_x) & (pts_base[:, 0] <= self.max_x)
+            & (pts_base[:, 1] >= self.min_y) & (pts_base[:, 1] <= self.max_y)
+            & (pts_base[:, 2] >= self.min_z) & (pts_base[:, 2] <= self.max_z)
+        )
+        mask = bbox_mask & ws_mask
+
+        n_inliers = int(mask.sum())
+        if n_inliers < self.min_inliers:
+            self.get_logger().warn(
+                f'Only {n_inliers} inliers (< {self.min_inliers}) — skipping.',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        filtered = pts_base[mask].astype(np.float32)
+        header = Header(frame_id=self.target_frame, stamp=msg.header.stamp)
+        self.filtered_points_pub.publish(pc2.create_cloud_xyz32(header, filtered.tolist()))
+
+        centroid = np.mean(filtered, axis=0)
+        ball_pose = PointStamped()
+        ball_pose.header.stamp = self.get_clock().now().to_msg()
+        ball_pose.header.frame_id = self.target_frame
+        ball_pose.point.x = float(centroid[0])
+        ball_pose.point.y = float(centroid[1])
+        ball_pose.point.z = float(centroid[2])
+        self.ball_pose_pub.publish(ball_pose)
+
+    # ---------------------------------------------------------------- YOLO
+
+    def _detect_bboxes(self, bgr: np.ndarray):
+        results = self.model.predict(
+            bgr,
+            conf=self.conf_thresh,
+            classes=[self.class_id],
+            verbose=False,
+        )
+        bboxes = []
+        for r in results:
+            if r.boxes is None or r.boxes.xyxy is None:
+                continue
+            for b in r.boxes.xyxy.cpu().numpy():
+                bboxes.append(b.astype(int))
+        return bboxes
+
+    # ------------------------------------------------------------ params
+
+    def _on_parameter_update(self, params):
+        bounds = {
+            'min_x': self.min_x, 'max_x': self.max_x,
+            'min_y': self.min_y, 'max_y': self.max_y,
+            'min_z': self.min_z, 'max_z': self.max_z,
+        }
+        new_conf = self.conf_thresh
+        new_class = self.class_id
+        new_min_inliers = self.min_inliers
+
+        for p in params:
+            if p.name in bounds and p.type_ == Parameter.Type.DOUBLE:
+                bounds[p.name] = float(p.value)
+            elif p.name == 'yolo_conf' and p.type_ == Parameter.Type.DOUBLE:
+                if not 0.0 <= p.value <= 1.0:
+                    return SetParametersResult(
+                        successful=False, reason='yolo_conf must be in [0, 1]')
+                new_conf = float(p.value)
+            elif p.name == 'yolo_class' and p.type_ == Parameter.Type.INTEGER:
+                new_class = int(p.value)
+            elif p.name == 'min_inliers' and p.type_ == Parameter.Type.INTEGER:
+                new_min_inliers = int(p.value)
+
+        if (bounds['min_x'] > bounds['max_x']
+                or bounds['min_y'] > bounds['max_y']
+                or bounds['min_z'] > bounds['max_z']):
+            return SetParametersResult(successful=False, reason='min_* must be <= max_*')
+
+        self.min_x, self.max_x = bounds['min_x'], bounds['max_x']
+        self.min_y, self.max_y = bounds['min_y'], bounds['max_y']
+        self.min_z, self.max_z = bounds['min_z'], bounds['max_z']
+        self.conf_thresh = new_conf
+        self.class_id = new_class
+        self.min_inliers = new_min_inliers
+        return SetParametersResult(successful=True)
+
+
+def _apply_transform(tf, pts: np.ndarray) -> np.ndarray:
+    """Apply a TransformStamped to (N, 3) points."""
+    t = tf.transform.translation
+    q = tf.transform.rotation
+    rot = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+    return pts @ rot.T + np.array([t.x, t.y, t.z])
 
 
 def main(args=None):
