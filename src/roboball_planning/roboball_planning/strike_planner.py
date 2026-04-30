@@ -55,7 +55,7 @@ JOINT_ORDER = [
 NUM_WAYPOINTS = 2
 CONTROL_PERIOD_S = 0.1
 BASE_FRAME = 'base_link'
-EE_FRAME = 'tool0'
+EE_FRAME = 'wrist_3_link'
 
 
 class StrikePlanner(Node):

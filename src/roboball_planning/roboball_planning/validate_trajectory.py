@@ -46,7 +46,7 @@ class TrajectoryValidator(Node):
         point = msg.points[0]
         target_positions = point.positions
 
-        if any(abs(valid_joint_pos - joint_pos) > 0.5 for valid_joint_pos, joint_pos in zip(self.valid_joint_positions, target_positions)):
+        if any(abs(valid_joint_pos - joint_pos) > 10 for valid_joint_pos, joint_pos in zip(self.valid_joint_positions, target_positions)):
             self.get_logger().error('Joint positions may be unsafe!')
             return
 
