@@ -76,13 +76,15 @@ class TrajectoryPredictor(Node):
         target.impact_pose.position.x = float(impact_xyz[0])
         target.impact_pose.position.y = float(impact_xyz[1])
         target.impact_pose.position.z = float(impact_xyz[2])
-        # Paddle pointing up (flip of lab5/7 "gripper down" convention):
-        # [qx,qy,qz,qw] = [1,0,0,0] rotates 180° about X, so the tool z-axis
-        # points up in base_link. Adjust once the paddle CAD is finalized.
-        target.impact_pose.orientation.x = 1.0
-        target.impact_pose.orientation.y = 0.0
-        target.impact_pose.orientation.z = 0.0
-        target.impact_pose.orientation.w = 0.0
+        # Paddle is mounted on the side of tool0; the wrist orientation that
+        # leaves the paddle face pointing ~up in base_link is the home pose
+        # captured below (measured via `tf2_echo base_link tool0`). Holding the
+        # wrist at this orientation across the strike means the IK only has to
+        # translate to the impact XY, not re-rotate the paddle.
+        target.impact_pose.orientation.x = -0.054
+        target.impact_pose.orientation.y = 0.697
+        target.impact_pose.orientation.z = -0.047
+        target.impact_pose.orientation.w = 0.713
 
         ttl = max(0.0, t_impact)
         target.time_to_impact = Duration(sec=int(ttl), nanosec=int((ttl % 1.0) * 1e9))
