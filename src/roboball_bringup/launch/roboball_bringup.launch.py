@@ -173,5 +173,5 @@ def generate_launch_description():
         ball_detector_node,
         predictor_node,
         strike_planner_node,
-        shutdown_on_any_exit,
+        # shutdown_on_any_exit,  # disabled during debugging — re-enable for demo
     ])
