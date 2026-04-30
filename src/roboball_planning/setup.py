@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'ik = roboball_planning.ik:main',
+            'ik_probe = roboball_planning.ik_probe:main',
             'trajectory_predictor = roboball_planning.trajectory_predictor:main',
             'strike_planner = roboball_planning.strike_planner:main',
             'validate_trajectory = roboball_planning.validate_trajectory:main',
