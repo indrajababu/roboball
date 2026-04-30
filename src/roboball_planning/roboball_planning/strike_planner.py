@@ -60,7 +60,13 @@ class StrikePlanner(Node):
         super().__init__('strike_planner')
         self._cb_group = ReentrantCallbackGroup()
         objective_mode = str(self.declare_parameter('objective_mode', 'intercept').value)
+        self.apply_objective = bool(self.declare_parameter('apply_objective', False).value)
+        self.use_current_tool_orientation = bool(
+            self.declare_parameter('use_current_tool_orientation', True).value
+        )
         self.num_waypoints = int(self.declare_parameter('num_waypoints', NUM_WAYPOINTS).value)
+        self.max_xy_step = float(self.declare_parameter('max_xy_step', 0.12).value)
+        self.max_z_drop = float(self.declare_parameter('max_z_drop', 0.02).value)
         self.min_exec_time = float(self.declare_parameter('min_exec_time', 0.12).value)
         self.ik_budget = float(self.declare_parameter('ik_budget', 0.08).value)
         self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.15).value)
@@ -178,11 +184,31 @@ class StrikePlanner(Node):
             msg.impact_pose.position.y,
             msg.impact_pose.position.z,
         ])
-        impact_xyz = self.objective.apply(
-            impact_xyz,
-            now_sec=self.get_clock().now().nanoseconds * 1e-9,
-        )
-        q = msg.impact_pose.orientation
+        if self.apply_objective:
+            impact_xyz = self.objective.apply(
+                impact_xyz,
+                now_sec=self.get_clock().now().nanoseconds * 1e-9,
+            )
+
+        # Keep per-strike displacement inside a reachable neighborhood around
+        # current pose; this prevents impossible IK requests from noisy targets.
+        xy_delta = impact_xyz[:2] - start_xyz[:2]
+        xy_norm = float(np.linalg.norm(xy_delta))
+        if xy_norm > self.max_xy_step and xy_norm > 1e-9:
+            impact_xyz[:2] = start_xyz[:2] + (xy_delta / xy_norm) * self.max_xy_step
+
+        min_allowed_z = start_xyz[2] - self.max_z_drop
+        if impact_xyz[2] < min_allowed_z:
+            impact_xyz[2] = min_allowed_z
+
+        if self.use_current_tool_orientation:
+            qx = tf.transform.rotation.x
+            qy = tf.transform.rotation.y
+            qz = tf.transform.rotation.z
+            qw = tf.transform.rotation.w
+        else:
+            q = msg.impact_pose.orientation
+            qx, qy, qz, qw = q.x, q.y, q.z, q.w
 
         predicted_tti = msg.time_to_impact.sec + msg.time_to_impact.nanosec * 1e-9
         msg_stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
@@ -200,7 +226,7 @@ class StrikePlanner(Node):
         build_start = time.monotonic()
         cart_traj = LinearTrajectory(start_xyz, impact_xyz, exec_time)
         joint_traj = self._build_joint_trajectory(
-            cart_traj, joint_state, q.x, q.y, q.z, q.w
+            cart_traj, joint_state, qx, qy, qz, qw
         )
         if joint_traj is None:
             return
@@ -225,7 +251,8 @@ class StrikePlanner(Node):
             self._busy = True
         self.get_logger().info(
             f'Strike updated: {self.num_waypoints} waypoints over {exec_time:.2f}s '
-            f'(age={msg_age:.3f}s, IK={build_elapsed:.3f}s) from {start_xyz} to {impact_xyz}.'
+            f'(age={msg_age:.3f}s, IK={build_elapsed:.3f}s) from {start_xyz} to {impact_xyz}. '
+            f'limits: max_xy_step={self.max_xy_step:.3f}, max_z_drop={self.max_z_drop:.3f}'
         )
 
     # ---------------------------------------------------------- trajectory build
@@ -233,10 +260,23 @@ class StrikePlanner(Node):
     def _build_joint_trajectory(self, cart_traj, joint_state, qx, qy, qz, qw):
         times = np.linspace(0.0, cart_traj.total_time, self.num_waypoints)
         positions = []
+        ik_seed_state = joint_state
+        start_pose = cart_traj.target_pose(0.0)
+        end_pose = cart_traj.target_pose(cart_traj.total_time)
+        self.get_logger().info(
+            'IK build start: '
+            f'waypoints={self.num_waypoints}, total_time={cart_traj.total_time:.3f}s, '
+            f'start=({start_pose[0]:.4f},{start_pose[1]:.4f},{start_pose[2]:.4f}), '
+            f'end=({end_pose[0]:.4f},{end_pose[1]:.4f},{end_pose[2]:.4f}), '
+            f'quat=({qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f})'
+        )
         for i, t in enumerate(times):
+            if i == 0:
+                positions.append(_reorder_positions(joint_state, JOINT_ORDER))
+                continue
             pose = cart_traj.target_pose(t)
             sol = self.ik_planner.compute_ik(
-                joint_state,
+                ik_seed_state,
                 pose[0], pose[1], pose[2],
                 qx=qx, qy=qy, qz=qz, qw=qw,
                 timeout_sec=self.ik_timeout,
@@ -244,9 +284,12 @@ class StrikePlanner(Node):
             if sol is None:
                 self.get_logger().error(
                     f'IK failed at waypoint {i + 1}/{self.num_waypoints} '
-                    f'(xyz={pose[:3]}). Aborting strike.'
+                    f'(t={t:.3f}s, xyz={pose[:3]}). Aborting strike. '
+                    f'quat=({qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f}), '
+                    f'joint_state={_current_joint_summary(joint_state, JOINT_ORDER)}'
                 )
                 return None
+            ik_seed_state = sol
             positions.append(_reorder_positions(sol, JOINT_ORDER))
 
         positions = np.array(positions)
@@ -343,6 +386,14 @@ def _current_joint_vector(joint_state: JointState, order):
     pos = np.array([name_to_pos[n] for n in order])
     vel = np.array([name_to_vel.get(n, 0.0) for n in order])
     return pos, vel
+
+
+def _current_joint_summary(joint_state: JointState, order):
+    if joint_state is None:
+        return 'none'
+    name_to_pos = dict(zip(joint_state.name, joint_state.position))
+    values = [f'{n}={name_to_pos.get(n, float("nan")):.3f}' for n in order]
+    return ', '.join(values)
 
 
 def _finite_diff(positions, times):

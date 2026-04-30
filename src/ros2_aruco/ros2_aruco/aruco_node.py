@@ -71,6 +71,37 @@ def _detect_markers(cv_image, aruco_dictionary, aruco_parameters):
         cv_image, aruco_dictionary, parameters=aruco_parameters
     )
 
+
+def _estimate_pose_single_markers(corners, marker_size, intrinsic_mat, distortion):
+    """Estimate marker poses across OpenCV API versions.
+
+    Returns rvecs/tvecs in shape-compatible form where each element is (1, 3),
+    matching cv2.aruco.estimatePoseSingleMarkers output indexing.
+    """
+    if hasattr(cv2.aruco, "estimatePoseSingleMarkers"):
+        rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+            corners, marker_size, intrinsic_mat, distortion
+        )
+        return rvecs, tvecs
+
+    obj_points = np.array([
+        [-marker_size / 2.0, marker_size / 2.0, 0.0],
+        [marker_size / 2.0, marker_size / 2.0, 0.0],
+        [marker_size / 2.0, -marker_size / 2.0, 0.0],
+        [-marker_size / 2.0, -marker_size / 2.0, 0.0],
+    ], dtype=np.float32)
+
+    rvecs = []
+    tvecs = []
+    for corner in corners:
+        ok, rvec, tvec = cv2.solvePnP(obj_points, corner, intrinsic_mat, distortion)
+        if not ok:
+            continue
+        rvecs.append(rvec.reshape((1, 3)))
+        tvecs.append(tvec.reshape((1, 3)))
+
+    return rvecs, tvecs
+
 def quaternion_from_matrix(matrix):
     """Return quaternion from rotation matrix.
 
@@ -275,15 +306,9 @@ class ArucoNode(rclpy.node.Node):
                     goal_markers.append(marker_id)
 
             if len(goal_markers) > 0:
-                goal_rvecs, goal_tvecs = [], []
-                if cv2.__version__ > "4.0.0":
-                    goal_rvecs, goal_tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-                        goal_corners, 0.15, self.intrinsic_mat, self.distortion
-                    )
-                else:
-                    goal_rvecs, goal_tvecs = cv2.aruco.estimatePoseSingleMarkers(
-                        goal_corners, goal_markers, self.intrinsic_mat, self.distortion
-                    )
+                goal_rvecs, goal_tvecs = _estimate_pose_single_markers(
+                    goal_corners, 0.15, self.intrinsic_mat, self.distortion
+                )
                 self.get_logger().info(f"info is {goal_rvecs}, {goal_tvecs}")
                 self.get_logger().info(f"info is {goal_markers}")
                 rvecs.extend(goal_rvecs)
@@ -291,15 +316,9 @@ class ArucoNode(rclpy.node.Node):
                 final_marker_ids.extend(goal_markers)
 
             if len(turtlebot_markers) > 0:
-                turtlebot_rvecs, turtlebot_tvecs = [], []
-                if cv2.__version__ > "4.0.0":
-                    turtlebot_rvecs, turtlebot_tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-                        turtlebot_corners, 0.05, self.intrinsic_mat, self.distortion
-                    )
-                else:
-                    turtlebot_rvecs, turtlebot_tvecs = cv2.aruco.estimatePoseSingleMarkers(
-                        turtlebot_corners, turtlebot_markers, self.intrinsic_mat, self.distortion
-                    )
+                turtlebot_rvecs, turtlebot_tvecs = _estimate_pose_single_markers(
+                    turtlebot_corners, 0.05, self.intrinsic_mat, self.distortion
+                )
                 rvecs.extend(turtlebot_rvecs)
                 tvecs.extend(turtlebot_tvecs)
                 final_marker_ids.extend(turtlebot_markers)

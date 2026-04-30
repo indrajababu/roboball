@@ -72,7 +72,8 @@ class TrajectoryPredictor(Node):
             return
 
         target = StrikeTarget()
-        target.header = msg.header
+        target.header.frame_id = msg.header.frame_id
+        target.header.stamp = self.get_clock().now().to_msg()
         target.impact_pose.position.x = float(impact_xyz[0])
         target.impact_pose.position.y = float(impact_xyz[1])
         target.impact_pose.position.z = float(impact_xyz[2])
@@ -81,10 +82,10 @@ class TrajectoryPredictor(Node):
         # captured below (measured via `tf2_echo base_link tool0`). Holding the
         # wrist at this orientation across the strike means the IK only has to
         # translate to the impact XY, not re-rotate the paddle.
-        target.impact_pose.orientation.x = -0.054
-        target.impact_pose.orientation.y = 0.697
-        target.impact_pose.orientation.z = -0.047
-        target.impact_pose.orientation.w = 0.713
+        target.impact_pose.orientation.x = -0.007
+        target.impact_pose.orientation.y = 0.699
+        target.impact_pose.orientation.z = 0.0
+        target.impact_pose.orientation.w = 0.715
 
         ttl = max(0.0, t_impact)
         target.time_to_impact = Duration(sec=int(ttl), nanosec=int((ttl % 1.0) * 1e9))
