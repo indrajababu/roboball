@@ -143,9 +143,10 @@ def generate_launch_description():
         name='strike_planner',
         output='screen',
         parameters=[{
-            'num_waypoints': 5,
+            'num_waypoints': 2,
             'ik_budget': 0.08,
             'ik_timeout': 0.15,
+            'paddle_contact_offset_xyz': [-0.094, -0.057, 0.145],
             'publish_debug_markers': True,
             'debug_marker_frame': 'base_link',
         }],

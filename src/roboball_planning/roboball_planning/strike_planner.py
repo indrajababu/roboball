@@ -67,6 +67,14 @@ class StrikePlanner(Node):
         self.use_current_tool_orientation = bool(
             self.declare_parameter('use_current_tool_orientation', True).value
         )
+        paddle_offset = self.declare_parameter(
+            'paddle_contact_offset_xyz',
+            [-0.094, -0.057, 0.145],
+        ).value
+        self.paddle_contact_offset = np.array(
+            [float(paddle_offset[0]), float(paddle_offset[1]), float(paddle_offset[2])],
+            dtype=np.float64,
+        )
         self.num_waypoints = int(self.declare_parameter('num_waypoints', NUM_WAYPOINTS).value)
         self.max_xy_step = float(self.declare_parameter('max_xy_step', 0.12).value)
         self.max_z_drop = float(self.declare_parameter('max_z_drop', 0.02).value)
@@ -160,6 +168,7 @@ class StrikePlanner(Node):
             f'Strike planner up. objective_mode={self.objective.config.mode}. '
             f'num_waypoints={self.num_waypoints}, ik_budget={self.ik_budget:.2f}s, '
             f'ik_timeout={self.ik_timeout:.2f}s. '
+            f'paddle_contact_offset={self.paddle_contact_offset.tolist()}. '
             f'publish_debug_markers={self.publish_debug_markers}. '
             'Waiting for /strike_target...'
         )
@@ -197,41 +206,55 @@ class StrikePlanner(Node):
             self.get_logger().warn(f'TF lookup {BASE_FRAME}->{EE_FRAME} failed: {ex}')
             return
 
-        start_xyz = np.array([
+        start_tool_xyz = np.array([
             tf.transform.translation.x,
             tf.transform.translation.y,
             tf.transform.translation.z,
         ])
-        impact_xyz = np.array([
+        current_qx = tf.transform.rotation.x
+        current_qy = tf.transform.rotation.y
+        current_qz = tf.transform.rotation.z
+        current_qw = tf.transform.rotation.w
+        current_tool_rot = _quat_to_rot(current_qx, current_qy, current_qz, current_qw)
+        start_contact_xyz = start_tool_xyz + current_tool_rot @ self.paddle_contact_offset
+
+        impact_contact_xyz = np.array([
             msg.impact_pose.position.x,
             msg.impact_pose.position.y,
             msg.impact_pose.position.z,
         ])
+        raw_contact_xyz = impact_contact_xyz.copy()
         if self.apply_objective:
-            impact_xyz = self.objective.apply(
-                impact_xyz,
+            impact_contact_xyz = self.objective.apply(
+                impact_contact_xyz,
                 now_sec=self.get_clock().now().nanoseconds * 1e-9,
             )
 
-        # Keep per-strike displacement inside a reachable neighborhood around
-        # current pose; this prevents impossible IK requests from noisy targets.
-        xy_delta = impact_xyz[:2] - start_xyz[:2]
+        # Clamp the paddle contact point, then convert back to the tool0 pose
+        # that IK actually solves. This keeps the contact surface, not the
+        # flange origin, aligned with the predicted ball target.
+        xy_delta = impact_contact_xyz[:2] - start_contact_xyz[:2]
         xy_norm = float(np.linalg.norm(xy_delta))
         if xy_norm > self.max_xy_step and xy_norm > 1e-9:
-            impact_xyz[:2] = start_xyz[:2] + (xy_delta / xy_norm) * self.max_xy_step
+            impact_contact_xyz[:2] = start_contact_xyz[:2] + (
+                xy_delta / xy_norm
+            ) * self.max_xy_step
 
-        min_allowed_z = start_xyz[2] - self.max_z_drop
-        if impact_xyz[2] < min_allowed_z:
-            impact_xyz[2] = min_allowed_z
+        min_allowed_z = start_contact_xyz[2] - self.max_z_drop
+        if impact_contact_xyz[2] < min_allowed_z:
+            impact_contact_xyz[2] = min_allowed_z
 
         if self.use_current_tool_orientation:
-            qx = tf.transform.rotation.x
-            qy = tf.transform.rotation.y
-            qz = tf.transform.rotation.z
-            qw = tf.transform.rotation.w
+            qx = current_qx
+            qy = current_qy
+            qz = current_qz
+            qw = current_qw
         else:
             q = msg.impact_pose.orientation
             qx, qy, qz, qw = q.x, q.y, q.z, q.w
+
+        desired_tool_rot = _quat_to_rot(qx, qy, qz, qw)
+        impact_tool_xyz = impact_contact_xyz - desired_tool_rot @ self.paddle_contact_offset
 
         predicted_tti = msg.time_to_impact.sec + msg.time_to_impact.nanosec * 1e-9
         msg_stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
@@ -247,7 +270,7 @@ class StrikePlanner(Node):
             return
 
         build_start = time.monotonic()
-        cart_traj = LinearTrajectory(start_xyz, impact_xyz, exec_time)
+        cart_traj = LinearTrajectory(start_tool_xyz, impact_tool_xyz, exec_time)
         joint_traj = self._build_joint_trajectory(
             cart_traj, joint_state, qx, qy, qz, qw
         )
@@ -274,7 +297,11 @@ class StrikePlanner(Node):
             self._busy = True
         self.get_logger().info(
             f'Strike updated: {self.num_waypoints} waypoints over {exec_time:.2f}s '
-            f'(age={msg_age:.3f}s, IK={build_elapsed:.3f}s) from {start_xyz} to {impact_xyz}. '
+            f'(age={msg_age:.3f}s, IK={build_elapsed:.3f}s) '
+            f'tool {start_tool_xyz} -> {impact_tool_xyz}; '
+            f'contact {start_contact_xyz} -> raw {raw_contact_xyz}, '
+            f'clamped {impact_contact_xyz}. '
+            f'offset_tool0_to_contact={self.paddle_contact_offset.tolist()}, '
             f'limits: max_xy_step={self.max_xy_step:.3f}, max_z_drop={self.max_z_drop:.3f}'
         )
 
@@ -303,24 +330,13 @@ class StrikePlanner(Node):
                 continue
             pose = cart_points[i]
 
-            if i == len(times) - 1:
-                # Only final waypoint uses desired impact orientation.
-                req_qx, req_qy, req_qz, req_qw = qx, qy, qz, qw
-                sol = self.ik_planner.compute_ik(
-                    seed_state,
-                    pose[0], pose[1], pose[2],
-                    qx=req_qx, qy=req_qy, qz=req_qz, qw=req_qw,
-                    timeout_sec=self.ik_timeout,
-                )
-            else:
-                # Intermediate waypoints favor translational feasibility.
-                req_qx, req_qy, req_qz, req_qw = 0.0, 0.0, 0.0, 1.0
-                sol = self.ik_planner.compute_ik(
-                    seed_state,
-                    pose[0], pose[1], pose[2],
-                    qx=req_qx, qy=req_qy, qz=req_qz, qw=req_qw,
-                    timeout_sec=self.ik_timeout,
-                )
+            req_qx, req_qy, req_qz, req_qw = qx, qy, qz, qw
+            sol = self.ik_planner.compute_ik(
+                seed_state,
+                pose[0], pose[1], pose[2],
+                qx=req_qx, qy=req_qy, qz=req_qz, qw=req_qw,
+                timeout_sec=self.ik_timeout,
+            )
             waypoint_quats.append((req_qx, req_qy, req_qz, req_qw))
             if sol is None:
                 waypoint_success[i] = False

@@ -72,8 +72,9 @@ class TrajectoryPredictor(Node):
             return
 
         target = StrikeTarget()
-        target.header.frame_id = msg.header.frame_id
-        target.header.stamp = self.get_clock().now().to_msg()
+        # Keep the sensor stamp: downstream planning subtracts this age from
+        # time_to_impact so camera/perception latency does not get hidden.
+        target.header = msg.header
         target.impact_pose.position.x = float(impact_xyz[0])
         target.impact_pose.position.y = float(impact_xyz[1])
         target.impact_pose.position.z = float(impact_xyz[2])

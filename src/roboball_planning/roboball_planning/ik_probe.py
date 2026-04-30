@@ -121,6 +121,32 @@ def _parse_seed(seed_csv: str | None) -> list[float] | None:
     return values
 
 
+def _parse_xyz(csv: str | None) -> list[float] | None:
+    if csv is None:
+        return None
+    values = [float(v.strip()) for v in csv.split(',') if v.strip()]
+    if len(values) != 3:
+        raise ValueError('expected exactly 3 comma-separated values')
+    return values
+
+
+def _quat_to_rot(x: float, y: float, z: float, w: float):
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ]
+
+
+def _apply_contact_offset(x, y, z, qx, qy, qz, qw, offset):
+    rot = _quat_to_rot(qx, qy, qz, qw)
+    tool = [
+        x - sum(rot[row][col] * offset[col] for col in range(3))
+        for row in range(3)
+    ]
+    return tool
+
+
 def main(args=None):
     parser = argparse.ArgumentParser(description='Direct IK probe for /compute_ik')
     parser.add_argument('--x', type=float, required=True)
@@ -135,6 +161,12 @@ def main(args=None):
     parser.add_argument('--service-wait', type=float, default=10.0)
     parser.add_argument('--joint-state-wait', type=float, default=2.0)
     parser.add_argument('--seed', type=str, default=None)
+    parser.add_argument(
+        '--paddle-contact-offset',
+        type=str,
+        default=None,
+        help='Treat --x/--y/--z as paddle contact target and convert to tool0 using dx,dy,dz in tool0 frame',
+    )
     parser.add_argument('--avoid-collisions', action='store_true')
     parsed = parser.parse_args(args=args)
 
@@ -159,11 +191,22 @@ def main(args=None):
             node.get_logger().info('Using explicit --seed values as IK seed')
 
         qx, qy, qz, qw = _normalize_quat(parsed.qx, parsed.qy, parsed.qz, parsed.qw)
+        target_x, target_y, target_z = parsed.x, parsed.y, parsed.z
+        offset = _parse_xyz(parsed.paddle_contact_offset)
+        if offset is not None:
+            target_x, target_y, target_z = _apply_contact_offset(
+                parsed.x, parsed.y, parsed.z, qx, qy, qz, qw, offset
+            )
+            node.get_logger().info(
+                'Converted paddle contact target '
+                f'({parsed.x:.4f},{parsed.y:.4f},{parsed.z:.4f}) with offset={offset} '
+                f'to tool0 target ({target_x:.4f},{target_y:.4f},{target_z:.4f})'
+            )
         result = node.call_ik(
             seed,
-            parsed.x,
-            parsed.y,
-            parsed.z,
+            target_x,
+            target_y,
+            target_z,
             qx,
             qy,
             qz,
@@ -178,7 +221,7 @@ def main(args=None):
 
         code = int(result.error_code.val)
         node.get_logger().info(
-            f'IK response code={code} for pose=({parsed.x:.4f},{parsed.y:.4f},{parsed.z:.4f}) '
+            f'IK response code={code} for tool0 pose=({target_x:.4f},{target_y:.4f},{target_z:.4f}) '
             f'quat=({qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f}) timeout={parsed.timeout:.3f}s '
             f'avoid_collisions={parsed.avoid_collisions}'
         )
