@@ -4,19 +4,25 @@ Top-level Roboball bring-up.
 Launches, in order:
   - RealSense camera (rgb + depth + pointcloud)
   - MoveIt for UR7e (provides /compute_ik, /plan_kinematic_path)
-  - Static TF broadcaster (base_link -> camera_color_optical_frame)
+  - ArUco + static TF broadcaster (camera -> ar_marker_N -> base_link)
   - Trajectory validator (safety layer in front of the UR trajectory controller)
-  - Ball detector (publishes /ball_pose)
+  - Ball detector (publishes /ball_pose), default detector: HSV
   - Trajectory predictor (publishes /strike_target)
-  - Strike planner (consumes /strike_target, drives the arm)
+  - Strike planner (gated off by default — see start_strike_planner)
 
 Seeded from lab5/planning/launch/lab5_bringup.launch.py.
 
 Usage:
   ros2 launch roboball_bringup roboball_bringup.launch.py
 Optional args:
-  launch_rviz:=false    — skip MoveIt's RViz
-  ur_type:=ur7e         — robot type forwarded to ur_moveit_config
+  launch_rviz:=false                 — skip MoveIt's RViz
+  ur_type:=ur7e                      — robot type forwarded to ur_moveit_config
+  detector:=hsv|yolo                 — ball_detector backend (default hsv)
+  strike_height:=<meters>            — strike-plane Z in base_link (default 0.0)
+  start_strike_planner:=true|false   — auto-start the strike planner (default false).
+                                       Off so go_home keeps using
+                                       scaled_joint_trajectory_controller; start
+                                       the planner manually once parked.
 """
 
 import os
@@ -29,17 +35,22 @@ from launch.actions import (
     IncludeLaunchDescription,
     RegisterEventHandler,
 )
+from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     ur_type = LaunchConfiguration('ur_type', default='ur7e')
     launch_rviz = LaunchConfiguration('launch_rviz', default='true')
     marker_number = LaunchConfiguration('marker_number', default='-1')
+    detector = LaunchConfiguration('detector', default='hsv')
+    strike_height = LaunchConfiguration('strike_height', default='0.0')
+    start_strike_planner = LaunchConfiguration('start_strike_planner', default='false')
 
     realsense_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -107,6 +118,7 @@ def generate_launch_description():
         executable='ball_detector',
         name='ball_detector',
         output='screen',
+        parameters=[{'detector': detector}],
     )
 
     predictor_node = Node(
@@ -114,6 +126,9 @@ def generate_launch_description():
         executable='trajectory_predictor',
         name='trajectory_predictor',
         output='screen',
+        parameters=[{
+            'strike_height': ParameterValue(strike_height, value_type=float),
+        }],
     )
 
     strike_planner_node = Node(
@@ -121,6 +136,7 @@ def generate_launch_description():
         executable='strike_planner',
         name='strike_planner',
         output='screen',
+        condition=IfCondition(start_strike_planner),
     )
 
     shutdown_on_any_exit = RegisterEventHandler(
@@ -133,6 +149,9 @@ def generate_launch_description():
         DeclareLaunchArgument('ur_type', default_value='ur7e'),
         DeclareLaunchArgument('launch_rviz', default_value='true'),
         DeclareLaunchArgument('marker_number', default_value='-1'),
+        DeclareLaunchArgument('detector', default_value='hsv'),
+        DeclareLaunchArgument('strike_height', default_value='0.0'),
+        DeclareLaunchArgument('start_strike_planner', default_value='false'),
         realsense_launch,
         moveit_launch,
         aruco_node,
