@@ -53,6 +53,11 @@ class BallDetector(Node):
         self.conf_thresh = float(self.declare_parameter('yolo_conf', 0.25).value)
         self.class_id = int(self.declare_parameter('yolo_class', SPORTS_BALL_CLASS_ID).value)
         self.min_inliers = int(self.declare_parameter('min_inliers', 20).value)
+        self.log_missed_classes = bool(
+            self.declare_parameter('yolo_log_missed_classes', True).value
+        )
+        self.yolo_infer_hz = float(self.declare_parameter('yolo_infer_hz', 8.0).value)
+        self.yolo_imgsz = int(self.declare_parameter('yolo_imgsz', 640).value)
 
         self.add_on_set_parameters_callback(self._on_parameter_update)
 
@@ -67,6 +72,9 @@ class BallDetector(Node):
         self.color_K = None
         self.image_w = 0
         self.image_h = 0
+        self._cached_target_dets = []
+        self._cached_all_dets = []
+        self._last_infer_time = -1e9
 
         self.create_subscription(Image, '/camera/camera/color/image_raw',
                                  self._on_image, qos_profile_sensor_data)
@@ -111,8 +119,29 @@ class BallDetector(Node):
             self.get_logger().warn('No camera_info yet.', throttle_duration_sec=2.0)
             return
 
-        bboxes = self._detect_bboxes(self.latest_bgr)
+        stamp_sec = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        infer_period = 1.0 / max(self.yolo_infer_hz, 0.1)
+        run_infer = (stamp_sec - self._last_infer_time) >= infer_period
+
+        if run_infer or not self._cached_all_dets:
+            bboxes, all_dets = self._detect_bboxes(self.latest_bgr)
+            self._cached_target_dets = bboxes
+            self._cached_all_dets = all_dets
+            self._last_infer_time = stamp_sec
+        else:
+            bboxes = self._cached_target_dets
+            all_dets = self._cached_all_dets
+
         if not bboxes:
+            if self.log_missed_classes and all_dets:
+                top = sorted(all_dets, key=lambda d: d['conf'], reverse=True)[:3]
+                summary = ', '.join(
+                    f"{d['name']}({d['class_id']}):{d['conf']:.2f}" for d in top
+                )
+                self.get_logger().warn(
+                    f'YOLO saw other classes, not target class-{self.class_id}: {summary}',
+                    throttle_duration_sec=2.0,
+                )
             self.get_logger().warn(
                 f'YOLO: no class-{self.class_id} detections.',
                 throttle_duration_sec=2.0,
@@ -148,7 +177,8 @@ class BallDetector(Node):
         in_image = in_front & (u >= 0) & (u < self.image_w) & (v >= 0) & (v < self.image_h)
 
         bbox_mask = np.zeros(len(pts_src), dtype=bool)
-        for x1, y1, x2, y2 in bboxes:
+        for bbox, _ in bboxes:
+            x1, y1, x2, y2 = [int(v) for v in bbox]
             bbox_mask |= in_image & (u >= x1) & (u <= x2) & (v >= y1) & (v <= y2)
 
         ws_mask = (
@@ -182,19 +212,37 @@ class BallDetector(Node):
     # ---------------------------------------------------------------- YOLO
 
     def _detect_bboxes(self, bgr: np.ndarray):
+        classes_filter = None if self.class_id < 0 else [self.class_id]
         results = self.model.predict(
             bgr,
             conf=self.conf_thresh,
-            classes=[self.class_id],
+            classes=classes_filter,
+            imgsz=self.yolo_imgsz,
             verbose=False,
         )
         bboxes = []
+        all_dets = []
+        names = self.model.names if hasattr(self.model, 'names') else {}
         for r in results:
             if r.boxes is None or r.boxes.xyxy is None:
                 continue
-            for b in r.boxes.xyxy.cpu().numpy():
-                bboxes.append(b.astype(int))
-        return bboxes
+            xyxy = r.boxes.xyxy.cpu().numpy()
+            confs = r.boxes.conf.cpu().numpy() if r.boxes.conf is not None else None
+            classes = r.boxes.cls.cpu().numpy().astype(int) if r.boxes.cls is not None else None
+            for i, b in enumerate(xyxy):
+                conf = float(confs[i]) if confs is not None else None
+                class_id = int(classes[i]) if classes is not None else -1
+                class_name = str(names.get(class_id, class_id)) if isinstance(names, dict) else str(class_id)
+                det = {
+                    'bbox': b.astype(int),
+                    'conf': 0.0 if conf is None else conf,
+                    'class_id': class_id,
+                    'name': class_name,
+                }
+                all_dets.append(det)
+                if self.class_id < 0 or class_id == self.class_id:
+                    bboxes.append((det['bbox'], det['conf']))
+        return bboxes, all_dets
 
     # ------------------------------------------------------------ params
 
