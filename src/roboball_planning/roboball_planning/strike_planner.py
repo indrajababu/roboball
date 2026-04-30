@@ -17,9 +17,14 @@ lab7/visual_servoing/main.py.
 """
 
 import subprocess
+import threading
+import time
 
 import numpy as np
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration as RclpyDuration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
@@ -44,7 +49,7 @@ JOINT_ORDER = [
     'wrist_3_joint',
 ]
 
-NUM_WAYPOINTS = 10
+NUM_WAYPOINTS = 5
 CONTROL_PERIOD_S = 0.1
 BASE_FRAME = 'base_link'
 EE_FRAME = 'tool0'
@@ -53,7 +58,12 @@ EE_FRAME = 'tool0'
 class StrikePlanner(Node):
     def __init__(self):
         super().__init__('strike_planner')
+        self._cb_group = ReentrantCallbackGroup()
         objective_mode = str(self.declare_parameter('objective_mode', 'intercept').value)
+        self.num_waypoints = int(self.declare_parameter('num_waypoints', NUM_WAYPOINTS).value)
+        self.min_exec_time = float(self.declare_parameter('min_exec_time', 0.12).value)
+        self.ik_budget = float(self.declare_parameter('ik_budget', 0.08).value)
+        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.15).value)
         blend_gain = float(self.declare_parameter('objective_blend_gain', 0.35).value)
         center_xy = tuple(self.declare_parameter('objective_center_xy', [0.45, 0.0]).value)
         zone_min_xy = tuple(self.declare_parameter('objective_zone_min_xy', [0.2, -0.3]).value)
@@ -91,8 +101,14 @@ class StrikePlanner(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.joint_state = None
-        self.create_subscription(JointState, '/joint_states', self._on_joint_state, 10)
-        self.create_subscription(StrikeTarget, '/strike_target', self._on_target, 10)
+        self.create_subscription(
+            JointState, '/joint_states', self._on_joint_state, 10,
+            callback_group=self._cb_group,
+        )
+        self.create_subscription(
+            StrikeTarget, '/strike_target', self._on_target, 10,
+            callback_group=self._cb_group,
+        )
 
         self.velocity_pub = self.create_publisher(
             Float64MultiArray, '/forward_velocity_controller/commands', 10
@@ -102,32 +118,50 @@ class StrikePlanner(Node):
         self._active_start = None
         self._interp_index = 0
         self._busy = False
+        self._planning = False
+        self._lock = threading.Lock()
 
         self._switch_controller(
             activate='forward_velocity_controller',
             deactivate='scaled_joint_trajectory_controller',
         )
 
-        self.create_timer(CONTROL_PERIOD_S, self._control_tick)
+        self.create_timer(CONTROL_PERIOD_S, self._control_tick, callback_group=self._cb_group)
 
         self.get_logger().info(
             f'Strike planner up. objective_mode={self.objective.config.mode}. '
+            f'num_waypoints={self.num_waypoints}, ik_budget={self.ik_budget:.2f}s, '
+            f'ik_timeout={self.ik_timeout:.2f}s. '
             'Waiting for /strike_target...'
         )
 
     # -------------------------------------------------------------- subscriptions
 
     def _on_joint_state(self, msg: JointState):
-        self.joint_state = msg
+        with self._lock:
+            self.joint_state = msg
 
     def _on_target(self, msg: StrikeTarget):
-        if self._busy:
-            self.get_logger().debug('Strike in flight, dropping new target.')
-            return
-        if self.joint_state is None:
+        with self._lock:
+            if self._planning:
+                self.get_logger().debug('IK build in progress, dropping superseded target.')
+                return
+            self._planning = True
+            joint_state = self.joint_state
+
+        if joint_state is None:
+            with self._lock:
+                self._planning = False
             self.get_logger().warn('No joint state yet, dropping target.')
             return
 
+        try:
+            self._plan_target(msg, joint_state)
+        finally:
+            with self._lock:
+                self._planning = False
+
+    def _plan_target(self, msg: StrikeTarget, joint_state: JointState):
         try:
             tf = self.tf_buffer.lookup_transform(BASE_FRAME, EE_FRAME, Time())
         except TransformException as ex:
@@ -150,42 +184,66 @@ class StrikePlanner(Node):
         )
         q = msg.impact_pose.orientation
 
-        time_to_impact = msg.time_to_impact.sec + msg.time_to_impact.nanosec * 1e-9
-        if time_to_impact < 0.2:
+        predicted_tti = msg.time_to_impact.sec + msg.time_to_impact.nanosec * 1e-9
+        msg_stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        msg_age = max(0.0, now_sec - msg_stamp) if msg_stamp > 0.0 else 0.0
+        remaining_to_impact = predicted_tti - msg_age
+        exec_time = remaining_to_impact - self.ik_budget
+        if exec_time < self.min_exec_time:
             self.get_logger().warn(
-                f'time_to_impact={time_to_impact:.3f}s too short — clamping to 0.2s'
+                f'target too late: predicted={predicted_tti:.3f}s age={msg_age:.3f}s '
+                f'budget={self.ik_budget:.3f}s remaining_exec={exec_time:.3f}s'
             )
-            time_to_impact = 0.2
+            return
 
-        cart_traj = LinearTrajectory(start_xyz, impact_xyz, time_to_impact)
-        joint_traj = self._build_joint_trajectory(cart_traj, q.x, q.y, q.z, q.w)
+        build_start = time.monotonic()
+        cart_traj = LinearTrajectory(start_xyz, impact_xyz, exec_time)
+        joint_traj = self._build_joint_trajectory(
+            cart_traj, joint_state, q.x, q.y, q.z, q.w
+        )
         if joint_traj is None:
             return
 
-        self._active_traj = joint_traj
-        self._active_start = self.get_clock().now()
-        self._interp_index = 0
-        self._busy = True
+        build_elapsed = time.monotonic() - build_start
+        actual_remaining = remaining_to_impact - build_elapsed
+        if actual_remaining < self.min_exec_time:
+            self.get_logger().warn(
+                f'IK finished too late: build={build_elapsed:.3f}s '
+                f'actual_remaining={actual_remaining:.3f}s'
+            )
+            return
+
+        # If IK took longer than the reserved budget, begin partway through
+        # the trajectory so the final waypoint still aligns with impact time.
+        elapsed_offset = max(0.0, cart_traj.total_time - actual_remaining)
+        active_start = self.get_clock().now() - RclpyDuration(seconds=elapsed_offset)
+        with self._lock:
+            self._active_traj = joint_traj
+            self._active_start = active_start
+            self._interp_index = 0
+            self._busy = True
         self.get_logger().info(
-            f'Strike armed: {NUM_WAYPOINTS} waypoints over {time_to_impact:.2f}s '
-            f'from {start_xyz} to {impact_xyz}.'
+            f'Strike updated: {self.num_waypoints} waypoints over {exec_time:.2f}s '
+            f'(age={msg_age:.3f}s, IK={build_elapsed:.3f}s) from {start_xyz} to {impact_xyz}.'
         )
 
     # ---------------------------------------------------------- trajectory build
 
-    def _build_joint_trajectory(self, cart_traj, qx, qy, qz, qw):
-        times = np.linspace(0.0, cart_traj.total_time, NUM_WAYPOINTS)
+    def _build_joint_trajectory(self, cart_traj, joint_state, qx, qy, qz, qw):
+        times = np.linspace(0.0, cart_traj.total_time, self.num_waypoints)
         positions = []
         for i, t in enumerate(times):
             pose = cart_traj.target_pose(t)
             sol = self.ik_planner.compute_ik(
-                self.joint_state,
+                joint_state,
                 pose[0], pose[1], pose[2],
                 qx=qx, qy=qy, qz=qz, qw=qw,
+                timeout_sec=self.ik_timeout,
             )
             if sol is None:
                 self.get_logger().error(
-                    f'IK failed at waypoint {i + 1}/{NUM_WAYPOINTS} '
+                    f'IK failed at waypoint {i + 1}/{self.num_waypoints} '
                     f'(xyz={pose[:3]}). Aborting strike.'
                 )
                 return None
@@ -208,24 +266,35 @@ class StrikePlanner(Node):
     # ---------------------------------------------------------------- 10 Hz loop
 
     def _control_tick(self):
-        if not self._busy or self._active_traj is None or self.joint_state is None:
+        with self._lock:
+            busy = self._busy
+            active_traj = self._active_traj
+            active_start = self._active_start
+            interp_index = self._interp_index
+            joint_state = self.joint_state
+
+        if not busy or active_traj is None or active_start is None or joint_state is None:
             return
 
-        elapsed = (self.get_clock().now() - self._active_start).nanoseconds * 1e-9
-        total_time = _last_time(self._active_traj)
+        elapsed = (self.get_clock().now() - active_start).nanoseconds * 1e-9
+        total_time = _last_time(active_traj)
 
         if elapsed >= total_time:
             self._publish_velocity(np.zeros(6))
             self.pid.integral_error = np.zeros(6)
-            self._busy = False
-            self._active_traj = None
+            with self._lock:
+                self._busy = False
+                self._active_traj = None
             self.get_logger().info(f'Strike complete (t={elapsed:.2f}s).')
             return
 
-        target_pos, target_vel, self._interp_index = _interpolate(
-            self._active_traj, elapsed, self._interp_index
+        target_pos, target_vel, next_index = _interpolate(
+            active_traj, elapsed, interp_index
         )
-        current_pos, current_vel = _current_joint_vector(self.joint_state, JOINT_ORDER)
+        with self._lock:
+            if self._active_traj is active_traj:
+                self._interp_index = next_index
+        current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
 
         cmd = self.pid.step_control(target_pos, target_vel, current_pos, current_vel)
         self._publish_velocity(cmd)
@@ -331,12 +400,15 @@ def _interpolate(joint_traj: JointTrajectory, t, current_index):
 def main(args=None):
     rclpy.init(args=args)
     node = StrikePlanner()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         node.restore_default_controller()
+        executor.remove_node(node)
         node.destroy_node()
         rclpy.shutdown()
 

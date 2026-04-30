@@ -54,7 +54,6 @@ try:
     from cv_bridge import CvBridge
     import sensor_msgs_py.point_cloud2 as pc2
     from tf2_ros import Buffer, TransformListener, TransformException
-    from tf2_sensor_msgs.tf2_sensor_msgs import do_transform_cloud
     from scipy.spatial.transform import Rotation as R
     _HAVE_ROS = True
 except ImportError:
@@ -96,6 +95,7 @@ class BallDetector(Node):
         self.max_y = float(self.declare_parameter('max_y',  0.80).value)
         self.min_z = float(self.declare_parameter('min_z',  0.00).value)
         self.max_z = float(self.declare_parameter('max_z',  2.00).value)
+        self.cloud_stride = max(1, int(self.declare_parameter('cloud_stride', 2).value))
 
         # ---- YOLO params ------------------------------------------------
         self.yolo_weights = str(self.declare_parameter('yolo_weights', 'yolov8n.pt').value)
@@ -163,7 +163,7 @@ class BallDetector(Node):
             f"Ball detector up. backend={self.detector_mode}, "
             f"target={self.target_frame}, "
             f"workspace x=[{self.min_x},{self.max_x}] y=[{self.min_y},{self.max_y}] "
-            f"z=[{self.min_z},{self.max_z}]."
+            f"z=[{self.min_z},{self.max_z}], cloud_stride={self.cloud_stride}."
         )
 
     # ----------------------------------------------------------- yolo init
@@ -267,6 +267,8 @@ class BallDetector(Node):
         pts_src = np.column_stack((raw['x'], raw['y'], raw['z'])).astype(np.float64)
         if pts_src.size == 0:
             return
+        if self.cloud_stride > 1:
+            pts_src = pts_src[::self.cloud_stride]
 
         pts_color = _apply_transform(tf_color, pts_src)
         pts_base = _apply_transform(tf_base, pts_src)
@@ -346,14 +348,10 @@ class BallDetector(Node):
             )
             return
 
-        # do_transform_cloud handles the rgb field for us — simpler than the
-        # YOLO path's manual matrix math.
-        transformed = do_transform_cloud(msg, tf)
-
+        # Color-filter before transforming; on a sparse ball mask this avoids
+        # spending transform time on most of the scene.
         try:
-            raw = pc2.read_points(
-                transformed, field_names=('x', 'y', 'z', 'rgb'), skip_nans=True,
-            )
+            raw = pc2.read_points(msg, field_names=('x', 'y', 'z', 'rgb'), skip_nans=True)
         except (ValueError, AssertionError) as ex:
             self.get_logger().warn(
                 f"Cloud has no rgb field ({ex}); HSV backend can't run.",
@@ -361,19 +359,35 @@ class BallDetector(Node):
             )
             return
 
-        points = np.column_stack((raw['x'], raw['y'], raw['z'])).astype(np.float32)
+        if raw.size == 0:
+            return
+        if self.cloud_stride > 1:
+            raw = raw[::self.cloud_stride]
+
+        color_mask = hsv_mask_from_packed_rgb(raw['rgb'], self._hsv_ranges())
+        if not np.any(color_mask):
+            self.get_logger().warn(
+                'No points survived HSV filter — check HSV params.',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        color_raw = raw[color_mask]
+        points_src = np.column_stack(
+            (color_raw['x'], color_raw['y'], color_raw['z'])
+        ).astype(np.float64)
+        points = _apply_transform(tf, points_src).astype(np.float32)
         ws_mask = (
             (points[:, 0] >= self.min_x) & (points[:, 0] <= self.max_x)
             & (points[:, 1] >= self.min_y) & (points[:, 1] <= self.max_y)
             & (points[:, 2] >= self.min_z) & (points[:, 2] <= self.max_z)
         )
-        color_mask = hsv_mask_from_packed_rgb(raw['rgb'], self._hsv_ranges())
-        mask = ws_mask & color_mask
+        mask = ws_mask
 
         n = int(mask.sum())
         if n == 0:
             self.get_logger().warn(
-                'No points survived box+HSV filters — check TF, box, and HSV params.',
+                'No HSV-matching points survived workspace filter — check TF and box params.',
                 throttle_duration_sec=2.0,
             )
             return
@@ -430,6 +444,7 @@ class BallDetector(Node):
         new_yolo_weights = self.yolo_weights
         new_min_color_points = self.min_color_points
         new_detector = self.detector_mode
+        new_cloud_stride = self.cloud_stride
 
         for p in params:
             if p.name in bounds and p.type_ == Parameter.Type.DOUBLE:
@@ -465,6 +480,11 @@ class BallDetector(Node):
                 new_yolo_weights = str(p.value)
             elif p.name == 'min_color_points' and p.type_ == Parameter.Type.INTEGER:
                 new_min_color_points = int(p.value)
+            elif p.name == 'cloud_stride' and p.type_ == Parameter.Type.INTEGER:
+                if int(p.value) < 1:
+                    return SetParametersResult(
+                        successful=False, reason='cloud_stride must be >= 1')
+                new_cloud_stride = int(p.value)
             elif p.name == 'detector' and p.type_ == Parameter.Type.STRING:
                 v = str(p.value).lower()
                 if v not in ('yolo', 'hsv'):
@@ -491,6 +511,7 @@ class BallDetector(Node):
         self.yolo_imgsz = new_yolo_imgsz
         self.yolo_weights = new_yolo_weights
         self.min_color_points = new_min_color_points
+        self.cloud_stride = new_cloud_stride
 
         if self.detector_mode == 'yolo' and self.model is None:
             try:

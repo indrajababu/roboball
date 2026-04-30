@@ -18,7 +18,7 @@ Optional args:
   launch_rviz:=false                 — skip MoveIt's RViz
   ur_type:=ur7e                      — robot type forwarded to ur_moveit_config
   detector:=hsv|yolo                 — ball_detector backend (default hsv)
-  strike_height:=<meters>            — strike-plane Z in base_link (default 0.0)
+  strike_height:=<meters>            — strike-plane Z in base_link (default 0.60)
   start_strike_planner:=true|false   — auto-start the strike planner (default false).
                                        Off so go_home keeps using
                                        scaled_joint_trajectory_controller; start
@@ -49,7 +49,7 @@ def generate_launch_description():
     launch_rviz = LaunchConfiguration('launch_rviz', default='true')
     marker_number = LaunchConfiguration('marker_number', default='-1')
     detector = LaunchConfiguration('detector', default='hsv')
-    strike_height = LaunchConfiguration('strike_height', default='0.0')
+    strike_height = LaunchConfiguration('strike_height', default='0.60')
     start_strike_planner = LaunchConfiguration('start_strike_planner', default='false')
 
     realsense_launch = IncludeLaunchDescription(
@@ -64,7 +64,8 @@ def generate_launch_description():
             'serial_no': "'843112070166'",
             'pointcloud.enable': 'true',
             'align_depth.enable': 'true',
-            'rgb_camera.color_profile': '1920x1080x30',
+            'rgb_camera.color_profile': '640x480x30',
+            'depth_module.depth_profile': '640x480x30',
         }.items(),
     )
 
@@ -118,7 +119,10 @@ def generate_launch_description():
         executable='ball_detector',
         name='ball_detector',
         output='screen',
-        parameters=[{'detector': detector}],
+        parameters=[{
+            'detector': detector,
+            'cloud_stride': 2,
+        }],
     )
 
     predictor_node = Node(
@@ -128,6 +132,8 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'strike_height': ParameterValue(strike_height, value_type=float),
+            'min_samples': 4,
+            'buffer_size': 12,
         }],
     )
 
@@ -136,6 +142,11 @@ def generate_launch_description():
         executable='strike_planner',
         name='strike_planner',
         output='screen',
+        parameters=[{
+            'num_waypoints': 5,
+            'ik_budget': 0.08,
+            'ik_timeout': 0.15,
+        }],
         condition=IfCondition(start_strike_planner),
     )
 
@@ -150,7 +161,7 @@ def generate_launch_description():
         DeclareLaunchArgument('launch_rviz', default_value='true'),
         DeclareLaunchArgument('marker_number', default_value='-1'),
         DeclareLaunchArgument('detector', default_value='hsv'),
-        DeclareLaunchArgument('strike_height', default_value='0.0'),
+        DeclareLaunchArgument('strike_height', default_value='0.60'),
         DeclareLaunchArgument('start_strike_planner', default_value='false'),
         realsense_launch,
         moveit_launch,

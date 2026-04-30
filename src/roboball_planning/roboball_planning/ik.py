@@ -45,7 +45,8 @@ class IKPlanner(Node):
     # TODO: Compute IK for a given (x, y, z) + quat and current robot joint state
     # -----------------------------------------------------------
     def compute_ik(self, current_joint_state, x, y, z,
-                   qx=0.0, qy=1.0, qz=0.0, qw=0.0): # Think about why the default quaternion is like this. Why is qy=1?
+                   qx=0.0, qy=1.0, qz=0.0, qw=0.0,
+                   timeout_sec=0.15): # Think about why the default quaternion is like this. Why is qy=1?
         pose = PoseStamped()
         pose.header.frame_id = 'base_link'
         pose.pose.position.x = float(x)
@@ -60,7 +61,10 @@ class IKPlanner(Node):
         ik_req.ik_request.pose_stamped = pose
         ik_req.ik_request.robot_state.joint_state = current_joint_state
         ik_req.ik_request.avoid_collisions = True
-        ik_req.ik_request.timeout = Duration(sec=5)
+        ik_req.ik_request.timeout = Duration(
+            sec=int(timeout_sec),
+            nanosec=int((timeout_sec % 1.0) * 1e9),
+        )
         ik_req.ik_request.group_name = 'ur_manipulator'
 
         future = self.ik_client.call_async(ik_req)

@@ -7,8 +7,8 @@ samples, fits a ballistic model (x,y linear; z with gravity), and publishes:
   /ball_state    (roboball_msgs/BallState)   — filtered current state
   /strike_target (roboball_msgs/StrikeTarget) — where/when to hit it
 
-This file is a **stub**. The buffer + ROS plumbing is wired up; the actual fit
-is TODO — see `_fit_ballistic` below.
+The predictor is intentionally low-latency: publish as soon as a small
+ballistic fit is possible, and let downstream planning account for message age.
 """
 
 from collections import deque
@@ -30,9 +30,9 @@ class TrajectoryPredictor(Node):
     def __init__(self):
         super().__init__('trajectory_predictor')
 
-        self.buffer_size = int(self.declare_parameter('buffer_size', 20).value)
-        self.min_samples = int(self.declare_parameter('min_samples', 8).value)
-        self.strike_height = float(self.declare_parameter('strike_height', 0.0).value)
+        self.buffer_size = int(self.declare_parameter('buffer_size', 12).value)
+        self.min_samples = int(self.declare_parameter('min_samples', 4).value)
+        self.strike_height = float(self.declare_parameter('strike_height', 0.60).value)
 
         self.samples: "deque[tuple[float, np.ndarray]]" = deque(maxlen=self.buffer_size)
 
