@@ -260,7 +260,7 @@ class StrikePlanner(Node):
     def _build_joint_trajectory(self, cart_traj, joint_state, qx, qy, qz, qw):
         times = np.linspace(0.0, cart_traj.total_time, self.num_waypoints)
         positions = []
-        ik_seed_state = joint_state
+        seed_state = joint_state
         start_pose = cart_traj.target_pose(0.0)
         end_pose = cart_traj.target_pose(cart_traj.total_time)
         self.get_logger().info(
@@ -275,12 +275,23 @@ class StrikePlanner(Node):
                 positions.append(_reorder_positions(joint_state, JOINT_ORDER))
                 continue
             pose = cart_traj.target_pose(t)
-            sol = self.ik_planner.compute_ik(
-                ik_seed_state,
-                pose[0], pose[1], pose[2],
-                qx=qx, qy=qy, qz=qz, qw=qw,
-                timeout_sec=self.ik_timeout,
-            )
+
+            if i == len(times) - 1:
+                # Only final waypoint uses desired impact orientation.
+                sol = self.ik_planner.compute_ik(
+                    seed_state,
+                    pose[0], pose[1], pose[2],
+                    qx=qx, qy=qy, qz=qz, qw=qw,
+                    timeout_sec=self.ik_timeout,
+                )
+            else:
+                # Intermediate waypoints favor translational feasibility.
+                sol = self.ik_planner.compute_ik(
+                    seed_state,
+                    pose[0], pose[1], pose[2],
+                    qx=0.0, qy=0.0, qz=0.0, qw=1.0,
+                    timeout_sec=self.ik_timeout,
+                )
             if sol is None:
                 self.get_logger().error(
                     f'IK failed at waypoint {i + 1}/{self.num_waypoints} '
@@ -289,8 +300,8 @@ class StrikePlanner(Node):
                     f'joint_state={_current_joint_summary(joint_state, JOINT_ORDER)}'
                 )
                 return None
-            ik_seed_state = sol
             positions.append(_reorder_positions(sol, JOINT_ORDER))
+            seed_state = sol
 
         positions = np.array(positions)
         velocities = _finite_diff(positions, times)
