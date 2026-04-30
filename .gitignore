@@ -6,3 +6,6 @@ __pycache__/
 .vscode/
 .idea/
 *.egg-info/
+
+yolov8n.pt
+.DS_Store

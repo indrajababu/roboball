@@ -47,6 +47,30 @@ from ros2_aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from tf2_ros import TransformBroadcaster
 
+
+def _get_aruco_dictionary(dictionary_id: int):
+    """Return an ArUco dictionary across OpenCV API versions."""
+    if hasattr(cv2.aruco, "getPredefinedDictionary"):
+        return cv2.aruco.getPredefinedDictionary(dictionary_id)
+    return cv2.aruco.Dictionary_get(dictionary_id)
+
+
+def _get_aruco_detector_parameters():
+    """Return ArUco detector parameters across OpenCV API versions."""
+    if hasattr(cv2.aruco, "DetectorParameters"):
+        return cv2.aruco.DetectorParameters()
+    return cv2.aruco.DetectorParameters_create()
+
+
+def _detect_markers(cv_image, aruco_dictionary, aruco_parameters):
+    """Detect ArUco markers across OpenCV API versions."""
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        detector = cv2.aruco.ArucoDetector(aruco_dictionary, aruco_parameters)
+        return detector.detectMarkers(cv_image)
+    return cv2.aruco.detectMarkers(
+        cv_image, aruco_dictionary, parameters=aruco_parameters
+    )
+
 def quaternion_from_matrix(matrix):
     """Return quaternion from rotation matrix.
 
@@ -192,8 +216,8 @@ class ArucoNode(rclpy.node.Node):
         self.intrinsic_mat = None
         self.distortion = None
 
-        self.aruco_dictionary = cv2.aruco.Dictionary_get(dictionary_id)
-        self.aruco_parameters = cv2.aruco.DetectorParameters_create()
+        self.aruco_dictionary = _get_aruco_dictionary(dictionary_id)
+        self.aruco_parameters = _get_aruco_detector_parameters()
 
         self.bridge = CvBridge()
 
@@ -222,8 +246,8 @@ class ArucoNode(rclpy.node.Node):
         markers.header.stamp = img_msg.header.stamp
         pose_array.header.stamp = img_msg.header.stamp
 
-        corners, marker_ids, rejected = cv2.aruco.detectMarkers(
-            cv_image, self.aruco_dictionary, parameters=self.aruco_parameters
+        corners, marker_ids, rejected = _detect_markers(
+            cv_image, self.aruco_dictionary, self.aruco_parameters
         )
 
         if marker_ids is not None:
@@ -329,10 +353,14 @@ class ArucoNode(rclpy.node.Node):
 def main():
     rclpy.init()
     node = ArucoNode()
-    rclpy.spin(node)
-
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
