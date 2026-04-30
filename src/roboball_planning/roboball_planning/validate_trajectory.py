@@ -17,7 +17,7 @@ class TrajectoryValidator(Node):
             'shoulder_pan_joint',
         ]
 
-        self.valid_joint_positions = [-1.9836, -1.6802, -1.1001, 1.5647, -3.4556, 4.4115]
+        self.valid_joint_positions = [-1.7394, -2.4058, 1.0243, 1.5489, -4.8575, 3.1717]
 
         self.create_subscription(
             JointTrajectory,

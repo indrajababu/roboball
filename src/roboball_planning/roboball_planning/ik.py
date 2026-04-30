@@ -59,9 +59,9 @@ class IKPlanner(Node):
 
         ik_req = GetPositionIK.Request()
         ik_req.ik_request.pose_stamped = pose
-        ik_req.ik_request.ik_link_name = 'tool0'
+        ik_req.ik_request.ik_link_name = 'wrist_3_link'
         ik_req.ik_request.robot_state.joint_state = current_joint_state
-        ik_req.ik_request.avoid_collisions = False
+        ik_req.ik_request.avoid_collisions = True
         ik_req.ik_request.timeout = Duration(
             sec=int(timeout_sec),
             nanosec=int((timeout_sec % 1.0) * 1e9),
