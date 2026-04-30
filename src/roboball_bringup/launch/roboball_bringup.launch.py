@@ -146,6 +146,8 @@ def generate_launch_description():
             'num_waypoints': 5,
             'ik_budget': 0.08,
             'ik_timeout': 0.15,
+            'publish_debug_markers': True,
+            'debug_marker_frame': 'base_link',
         }],
         condition=IfCondition(start_strike_planner),
     )

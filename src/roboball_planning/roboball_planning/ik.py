@@ -46,7 +46,7 @@ class IKPlanner(Node):
     # -----------------------------------------------------------
     def compute_ik(self, current_joint_state, x, y, z,
                    qx=0.0, qy=1.0, qz=0.0, qw=0.0,
-                   timeout_sec=0.15): # Think about why the default quaternion is like this. Why is qy=1?
+                   timeout_sec=0.25): # Think about why the default quaternion is like this. Why is qy=1?
         pose = PoseStamped()
         pose.header.frame_id = 'base_link'
         pose.pose.position.x = float(x)
@@ -59,8 +59,9 @@ class IKPlanner(Node):
 
         ik_req = GetPositionIK.Request()
         ik_req.ik_request.pose_stamped = pose
+        ik_req.ik_request.ik_link_name = 'tool0'
         ik_req.ik_request.robot_state.joint_state = current_joint_state
-        ik_req.ik_request.avoid_collisions = True
+        ik_req.ik_request.avoid_collisions = False
         ik_req.ik_request.timeout = Duration(
             sec=int(timeout_sec),
             nanosec=int((timeout_sec % 1.0) * 1e9),
@@ -71,12 +72,26 @@ class IKPlanner(Node):
         rclpy.spin_until_future_complete(self, future)
 
         if future.result() is None:
-            self.get_logger().error('IK service failed.')
+            self.get_logger().error(
+                'IK service failed. '
+                f'pose=({x:.4f},{y:.4f},{z:.4f}) '
+                f'quat=({qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f}) '
+                f'timeout={timeout_sec:.3f}s link={ik_req.ik_request.ik_link_name} '
+                f'avoid_collisions={ik_req.ik_request.avoid_collisions} '
+                f'joints={_joint_state_summary(current_joint_state)}'
+            )
             return None
 
         result = future.result()
         if result.error_code.val != result.error_code.SUCCESS:
-            self.get_logger().error(f'IK failed, code: {result.error_code.val}')
+            self.get_logger().error(
+                f'IK failed, code: {result.error_code.val}. '
+                f'pose=({x:.4f},{y:.4f},{z:.4f}) '
+                f'quat=({qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f}) '
+                f'timeout={timeout_sec:.3f}s link={ik_req.ik_request.ik_link_name} '
+                f'avoid_collisions={ik_req.ik_request.avoid_collisions} '
+                f'joints={_joint_state_summary(current_joint_state)}'
+            )
             return None
 
         self.get_logger().info('IK solution found.')
@@ -163,3 +178,10 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
+
+def _joint_state_summary(joint_state: JointState) -> str:
+    if joint_state is None or not joint_state.name or not joint_state.position:
+        return 'none'
+    pairs = [f'{n}={p:.3f}' for n, p in zip(joint_state.name, joint_state.position)]
+    return ', '.join(pairs)

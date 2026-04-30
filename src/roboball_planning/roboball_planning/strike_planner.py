@@ -26,12 +26,15 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration as RclpyDuration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
+from geometry_msgs.msg import Point, Pose, PoseArray
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 from tf2_ros import Buffer, TransformListener, TransformException
+from visualization_msgs.msg import Marker, MarkerArray
 
 from roboball_msgs.msg import StrikeTarget
 from roboball_planning.strike_objectives import ObjectiveConfig, StrikeObjectivePolicy
@@ -49,7 +52,7 @@ JOINT_ORDER = [
     'wrist_3_joint',
 ]
 
-NUM_WAYPOINTS = 5
+NUM_WAYPOINTS = 2
 CONTROL_PERIOD_S = 0.1
 BASE_FRAME = 'base_link'
 EE_FRAME = 'tool0'
@@ -69,7 +72,13 @@ class StrikePlanner(Node):
         self.max_z_drop = float(self.declare_parameter('max_z_drop', 0.02).value)
         self.min_exec_time = float(self.declare_parameter('min_exec_time', 0.12).value)
         self.ik_budget = float(self.declare_parameter('ik_budget', 0.08).value)
-        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.15).value)
+        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.25).value)
+        self.publish_debug_markers = bool(
+            self.declare_parameter('publish_debug_markers', True).value
+        )
+        self.debug_marker_frame = str(
+            self.declare_parameter('debug_marker_frame', 'base_link').value
+        )
         blend_gain = float(self.declare_parameter('objective_blend_gain', 0.35).value)
         center_xy = tuple(self.declare_parameter('objective_center_xy', [0.45, 0.0]).value)
         zone_min_xy = tuple(self.declare_parameter('objective_zone_min_xy', [0.2, -0.3]).value)
@@ -120,6 +129,19 @@ class StrikePlanner(Node):
             Float64MultiArray, '/forward_velocity_controller/commands', 10
         )
 
+        self.debug_marker_pub = None
+        self.debug_pose_pub = None
+        if self.publish_debug_markers:
+            debug_qos = QoSProfile(depth=1)
+            debug_qos.reliability = ReliabilityPolicy.RELIABLE
+            debug_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+            self.debug_marker_pub = self.create_publisher(
+                MarkerArray, '/strike_planner/debug_markers', debug_qos
+            )
+            self.debug_pose_pub = self.create_publisher(
+                PoseArray, '/strike_planner/debug_waypoint_poses', debug_qos
+            )
+
         self._active_traj = None
         self._active_start = None
         self._interp_index = 0
@@ -138,6 +160,7 @@ class StrikePlanner(Node):
             f'Strike planner up. objective_mode={self.objective.config.mode}. '
             f'num_waypoints={self.num_waypoints}, ik_budget={self.ik_budget:.2f}s, '
             f'ik_timeout={self.ik_timeout:.2f}s. '
+            f'publish_debug_markers={self.publish_debug_markers}. '
             'Waiting for /strike_target...'
         )
 
@@ -260,9 +283,12 @@ class StrikePlanner(Node):
     def _build_joint_trajectory(self, cart_traj, joint_state, qx, qy, qz, qw):
         times = np.linspace(0.0, cart_traj.total_time, self.num_waypoints)
         positions = []
+        cart_points = [cart_traj.target_pose(t) for t in times]
+        waypoint_quats = []
+        waypoint_success = [True] * len(times)
         seed_state = joint_state
-        start_pose = cart_traj.target_pose(0.0)
-        end_pose = cart_traj.target_pose(cart_traj.total_time)
+        start_pose = cart_points[0]
+        end_pose = cart_points[-1]
         self.get_logger().info(
             'IK build start: '
             f'waypoints={self.num_waypoints}, total_time={cart_traj.total_time:.3f}s, '
@@ -273,26 +299,37 @@ class StrikePlanner(Node):
         for i, t in enumerate(times):
             if i == 0:
                 positions.append(_reorder_positions(joint_state, JOINT_ORDER))
+                waypoint_quats.append((qx, qy, qz, qw))
                 continue
-            pose = cart_traj.target_pose(t)
+            pose = cart_points[i]
 
             if i == len(times) - 1:
                 # Only final waypoint uses desired impact orientation.
+                req_qx, req_qy, req_qz, req_qw = qx, qy, qz, qw
                 sol = self.ik_planner.compute_ik(
                     seed_state,
                     pose[0], pose[1], pose[2],
-                    qx=qx, qy=qy, qz=qz, qw=qw,
+                    qx=req_qx, qy=req_qy, qz=req_qz, qw=req_qw,
                     timeout_sec=self.ik_timeout,
                 )
             else:
                 # Intermediate waypoints favor translational feasibility.
+                req_qx, req_qy, req_qz, req_qw = 0.0, 0.0, 0.0, 1.0
                 sol = self.ik_planner.compute_ik(
                     seed_state,
                     pose[0], pose[1], pose[2],
-                    qx=0.0, qy=0.0, qz=0.0, qw=1.0,
+                    qx=req_qx, qy=req_qy, qz=req_qz, qw=req_qw,
                     timeout_sec=self.ik_timeout,
                 )
+            waypoint_quats.append((req_qx, req_qy, req_qz, req_qw))
             if sol is None:
+                waypoint_success[i] = False
+                self._publish_debug_visuals(
+                    cart_points,
+                    waypoint_quats,
+                    waypoint_success,
+                    failed_index=i,
+                )
                 self.get_logger().error(
                     f'IK failed at waypoint {i + 1}/{self.num_waypoints} '
                     f'(t={t:.3f}s, xyz={pose[:3]}). Aborting strike. '
@@ -302,6 +339,13 @@ class StrikePlanner(Node):
                 return None
             positions.append(_reorder_positions(sol, JOINT_ORDER))
             seed_state = sol
+
+        self._publish_debug_visuals(
+            cart_points,
+            waypoint_quats,
+            waypoint_success,
+            failed_index=None,
+        )
 
         positions = np.array(positions)
         velocities = _finite_diff(positions, times)
@@ -382,6 +426,137 @@ class StrikePlanner(Node):
             deactivate='forward_velocity_controller',
         )
 
+    # ---------------------------------------------------------- RViz debugging
+
+    def _publish_debug_visuals(self, cart_points, waypoint_quats, waypoint_success, failed_index):
+        if self.debug_marker_pub is None or self.debug_pose_pub is None:
+            return
+
+        # Transform base_link points into the RViz fixed frame so markers render
+        # regardless of whether fixed frame is 'world' or 'base_link'.
+        target_frame = self.debug_marker_frame
+        pts_in_target = cart_points  # default: same frame, no transform needed
+        rot = None
+        trans = None
+        if target_frame != BASE_FRAME:
+            try:
+                tf_t = self.tf_buffer.lookup_transform(
+                    target_frame, BASE_FRAME, Time()
+                )
+                q = tf_t.transform.rotation
+                t = tf_t.transform.translation
+                rot = _quat_to_rot(q.x, q.y, q.z, q.w)
+                trans = np.array([t.x, t.y, t.z])
+                pts_in_target = [
+                    rot @ np.array([float(p[0]), float(p[1]), float(p[2])]) + trans
+                    for p in cart_points
+                ]
+            except TransformException:
+                self.get_logger().warn(
+                    f'Debug markers: TF lookup {BASE_FRAME}->{target_frame} failed; '
+                    f'publishing in {BASE_FRAME} instead.',
+                    throttle_duration_sec=5.0,
+                )
+                target_frame = BASE_FRAME
+                pts_in_target = cart_points
+
+        stamp = Time().to_msg()
+
+        pose_array = PoseArray()
+        pose_array.header.frame_id = target_frame
+        pose_array.header.stamp = stamp
+        for pt, quat in zip(pts_in_target, waypoint_quats):
+            p = Pose()
+            p.position.x = float(pt[0])
+            p.position.y = float(pt[1])
+            p.position.z = float(pt[2])
+            p.orientation.x = float(quat[0])
+            p.orientation.y = float(quat[1])
+            p.orientation.z = float(quat[2])
+            p.orientation.w = float(quat[3])
+            pose_array.poses.append(p)
+        self.debug_pose_pub.publish(pose_array)
+
+        markers = MarkerArray()
+
+        clear = Marker()
+        clear.header.frame_id = target_frame
+        clear.header.stamp = stamp
+        clear.action = Marker.DELETEALL
+        markers.markers.append(clear)
+
+        path = Marker()
+        path.header.frame_id = target_frame
+        path.header.stamp = stamp
+        path.ns = 'strike_path'
+        path.id = 1
+        path.type = Marker.LINE_STRIP
+        path.action = Marker.ADD
+        path.scale.x = 0.008
+        path.color.r = 0.05
+        path.color.g = 0.75
+        path.color.b = 1.00
+        path.color.a = 1.00
+        for pt in pts_in_target:
+            p = Point()
+            p.x = float(pt[0])
+            p.y = float(pt[1])
+            p.z = float(pt[2])
+            path.points.append(p)
+        markers.markers.append(path)
+
+        waypoints = Marker()
+        waypoints.header.frame_id = target_frame
+        waypoints.header.stamp = stamp
+        waypoints.ns = 'strike_waypoints'
+        waypoints.id = 2
+        waypoints.type = Marker.SPHERE_LIST
+        waypoints.action = Marker.ADD
+        waypoints.scale.x = 0.025
+        waypoints.scale.y = 0.025
+        waypoints.scale.z = 0.025
+
+        for idx, pt in enumerate(pts_in_target):
+            p = Point()
+            p.x = float(pt[0])
+            p.y = float(pt[1])
+            p.z = float(pt[2])
+            waypoints.points.append(p)
+
+            color = _rgba(0.20, 0.85, 0.20, 1.00)
+            if failed_index is not None and idx == failed_index:
+                color = _rgba(0.95, 0.10, 0.10, 1.00)
+            elif not waypoint_success[idx]:
+                color = _rgba(0.95, 0.10, 0.10, 1.00)
+            elif idx == len(pts_in_target) - 1:
+                color = _rgba(1.00, 0.70, 0.10, 1.00)
+            waypoints.colors.append(color)
+
+        markers.markers.append(waypoints)
+
+        if failed_index is not None:
+            failed_pt = pts_in_target[failed_index]
+            text = Marker()
+            text.header.frame_id = target_frame
+            text.header.stamp = stamp
+            text.ns = 'strike_failure'
+            text.id = 3
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.scale.z = 0.05
+            text.color.r = 1.0
+            text.color.g = 0.2
+            text.color.b = 0.2
+            text.color.a = 1.0
+            text.pose.position.x = float(failed_pt[0])
+            text.pose.position.y = float(failed_pt[1])
+            text.pose.position.z = float(failed_pt[2] + 0.06)
+            text.pose.orientation.w = 1.0
+            text.text = f'IK FAIL wp {failed_index + 1}/{len(pts_in_target)}'
+            markers.markers.append(text)
+
+        self.debug_marker_pub.publish(markers)
+
 
 # ------------------------------------------------------------------- helpers
 
@@ -457,6 +632,24 @@ def _interpolate(joint_traj: JointTrajectory, t, current_index):
         target_vel = np.array(joint_traj.points[current_index].velocities)
 
     return target_pos, target_vel, current_index
+
+
+def _rgba(r, g, b, a):
+    c = Marker().color
+    c.r = float(r)
+    c.g = float(g)
+    c.b = float(b)
+    c.a = float(a)
+    return c
+
+
+def _quat_to_rot(x, y, z, w):
+    """Quaternion (x, y, z, w) → 3×3 rotation matrix."""
+    return np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - w*z),     2*(x*z + w*y)],
+        [    2*(x*y + w*z), 1 - 2*(x*x + z*z),     2*(y*z - w*x)],
+        [    2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x*x + y*y)],
+    ])
 
 
 def main(args=None):
