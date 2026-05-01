@@ -2,11 +2,14 @@
 Strike planner — Node 3 in the Roboball stack.
 
 For each `/strike_target`:
-  1. Look up current paddle pose via TF (`base_link` -> `tool0`).
-  2. Build a `LinearTrajectory` from current pose to impact pose over `time_to_impact`.
-  3. Pre-sample IK at NUM_WAYPOINTS evenly-spaced times; finite-difference for joint
+  1. Look up current tool pose via TF (`base_link` -> `tool0`).
+  2. Convert between the paddle contact point and `tool0` using the configured
+     paddle offset.
+  3. Build a `LinearTrajectory` from current paddle point to impact point over
+     `time_to_impact`.
+  4. Pre-sample IK at NUM_WAYPOINTS evenly-spaced times; finite-difference for joint
      velocities; pack into a JointTrajectory.
-  4. A 10 Hz timer interpolates that trajectory and drives the arm via
+  5. A 10 Hz timer interpolates that trajectory and drives the arm via
      `PIDJointVelocityController`, publishing to `/forward_velocity_controller/commands`.
 
 Activates `forward_velocity_controller` on startup and reverts to
@@ -55,7 +58,31 @@ JOINT_ORDER = [
 NUM_WAYPOINTS = 2
 CONTROL_PERIOD_S = 0.1
 BASE_FRAME = 'base_link'
-EE_FRAME = 'wrist_3_link'
+EE_FRAME = 'tool0'
+IK_LINK_NAME = 'tool0'
+INCH_TO_M = 0.0254
+DEFAULT_PADDLE_OFFSET_TOOL0 = [0.0, 0.0, 7.0 * INCH_TO_M]
+
+
+class PiecewiseLinearTrajectory:
+    """Cartesian linear segments through required waypoints."""
+
+    def __init__(self, times, positions):
+        self.key_times = np.array(times, dtype=np.float64)
+        self.positions = np.array(positions, dtype=np.float64)
+        self.total_time = float(self.key_times[-1])
+        self.contact_time = float(self.key_times[1])
+
+    def target_pose(self, time):
+        t = float(np.clip(time, self.key_times[0], self.key_times[-1]))
+        idx = int(np.searchsorted(self.key_times, t, side='right') - 1)
+        idx = max(0, min(idx, len(self.key_times) - 2))
+        t0 = self.key_times[idx]
+        t1 = self.key_times[idx + 1]
+        alpha = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+        pos = (1.0 - alpha) * self.positions[idx] + alpha * self.positions[idx + 1]
+        quat = np.array([0.0, 1.0, 0.0, 0.0])
+        return np.concatenate([pos, quat])
 
 
 class StrikePlanner(Node):
@@ -67,12 +94,57 @@ class StrikePlanner(Node):
         self.use_current_tool_orientation = bool(
             self.declare_parameter('use_current_tool_orientation', True).value
         )
+        self.orient_paddle_to_ball_velocity = bool(
+            self.declare_parameter('orient_paddle_to_ball_velocity', False).value
+        )
+        self.fallback_to_current_orientation = bool(
+            self.declare_parameter('fallback_to_current_orientation', True).value
+        )
+        self.paddle_normal_axis = str(
+            self.declare_parameter('paddle_normal_axis', '-y').value
+        )
         self.num_waypoints = int(self.declare_parameter('num_waypoints', NUM_WAYPOINTS).value)
+        self.limit_target_step = bool(self.declare_parameter('limit_target_step', False).value)
         self.max_xy_step = float(self.declare_parameter('max_xy_step', 0.12).value)
         self.max_z_drop = float(self.declare_parameter('max_z_drop', 0.02).value)
         self.min_exec_time = float(self.declare_parameter('min_exec_time', 0.12).value)
+        self.drop_late_targets = bool(self.declare_parameter('drop_late_targets', False).value)
+        self.late_target_exec_time = float(
+            self.declare_parameter('late_target_exec_time', 1.5).value
+        )
+        self.swing_through = bool(self.declare_parameter('swing_through', True).value)
+        self.follow_through_distance = float(
+            self.declare_parameter('follow_through_distance', 0.04).value
+        )
+        self.follow_through_duration = float(
+            self.declare_parameter('follow_through_duration', 1.0).value
+        )
+        self.follow_through_direction = np.array(
+            self.declare_parameter('follow_through_direction', [0.0, 0.0, 1.0]).value,
+            dtype=np.float64,
+        )
+        self.one_swing_per_target_burst = bool(
+            self.declare_parameter('one_swing_per_target_burst', True).value
+        )
+        self.rearm_quiet_time = float(self.declare_parameter('rearm_quiet_time', 0.75).value)
+        self.settle_position_tolerance = float(
+            self.declare_parameter('settle_position_tolerance', 0.025).value
+        )
+        self.settle_velocity_tolerance = float(
+            self.declare_parameter('settle_velocity_tolerance', 0.05).value
+        )
+        self.settle_timeout = float(self.declare_parameter('settle_timeout', 0.0).value)
         self.ik_budget = float(self.declare_parameter('ik_budget', 0.08).value)
         self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.25).value)
+        self.ee_frame = str(self.declare_parameter('ee_frame', EE_FRAME).value)
+        self.ik_link_name = str(self.declare_parameter('ik_link_name', IK_LINK_NAME).value)
+        self.paddle_offset_tool0 = np.array(
+            self.declare_parameter(
+                'paddle_offset_tool0',
+                DEFAULT_PADDLE_OFFSET_TOOL0,
+            ).value,
+            dtype=np.float64,
+        )
         self.publish_debug_markers = bool(
             self.declare_parameter('publish_debug_markers', True).value
         )
@@ -147,6 +219,8 @@ class StrikePlanner(Node):
         self._interp_index = 0
         self._busy = False
         self._planning = False
+        self._strike_armed = True
+        self._last_target_rx_time = None
         self._lock = threading.Lock()
 
         self._switch_controller(
@@ -160,6 +234,19 @@ class StrikePlanner(Node):
             f'Strike planner up. objective_mode={self.objective.config.mode}. '
             f'num_waypoints={self.num_waypoints}, ik_budget={self.ik_budget:.2f}s, '
             f'ik_timeout={self.ik_timeout:.2f}s. '
+            f'limit_target_step={self.limit_target_step}. '
+            f'drop_late_targets={self.drop_late_targets}, '
+            f'late_target_exec_time={self.late_target_exec_time:.2f}s. '
+            f'swing_through={self.swing_through}, '
+            f'follow_through_distance={self.follow_through_distance:.3f}m, '
+            f'follow_through_duration={self.follow_through_duration:.2f}s. '
+            f'one_swing_per_target_burst={self.one_swing_per_target_burst}, '
+            f'rearm_quiet_time={self.rearm_quiet_time:.2f}s. '
+            f'orient_paddle_to_ball_velocity={self.orient_paddle_to_ball_velocity}, '
+            f'fallback_to_current_orientation={self.fallback_to_current_orientation}, '
+            f'paddle_normal_axis={self.paddle_normal_axis}. '
+            f'ee_frame={self.ee_frame}, ik_link_name={self.ik_link_name}, '
+            f'paddle_offset_tool0={self.paddle_offset_tool0.tolist()}. '
             f'publish_debug_markers={self.publish_debug_markers}. '
             'Waiting for /strike_target...'
         )
@@ -171,7 +258,15 @@ class StrikePlanner(Node):
             self.joint_state = msg
 
     def _on_target(self, msg: StrikeTarget):
+        now_mono = time.monotonic()
         with self._lock:
+            self._last_target_rx_time = now_mono
+            if self.one_swing_per_target_burst and not self._strike_armed:
+                self.get_logger().debug('Strike disarmed until target stream goes quiet.')
+                return
+            if self._busy:
+                self.get_logger().debug('Strike already active, dropping superseded target.')
+                return
             if self._planning:
                 self.get_logger().debug('IK build in progress, dropping superseded target.')
                 return
@@ -185,23 +280,33 @@ class StrikePlanner(Node):
             return
 
         try:
-            self._plan_target(msg, joint_state)
+            accepted = self._plan_target(msg, joint_state)
+            if accepted and self.one_swing_per_target_burst:
+                with self._lock:
+                    self._strike_armed = False
         finally:
             with self._lock:
                 self._planning = False
 
     def _plan_target(self, msg: StrikeTarget, joint_state: JointState):
         try:
-            tf = self.tf_buffer.lookup_transform(BASE_FRAME, EE_FRAME, Time())
+            tf = self.tf_buffer.lookup_transform(BASE_FRAME, self.ee_frame, Time())
         except TransformException as ex:
-            self.get_logger().warn(f'TF lookup {BASE_FRAME}->{EE_FRAME} failed: {ex}')
-            return
+            self.get_logger().warn(f'TF lookup {BASE_FRAME}->{self.ee_frame} failed: {ex}')
+            return False
 
-        start_xyz = np.array([
+        tool_xyz = np.array([
             tf.transform.translation.x,
             tf.transform.translation.y,
             tf.transform.translation.z,
         ])
+        tool_quat = (
+            tf.transform.rotation.x,
+            tf.transform.rotation.y,
+            tf.transform.rotation.z,
+            tf.transform.rotation.w,
+        )
+        start_xyz = _tool_to_paddle_xyz(tool_xyz, tool_quat, self.paddle_offset_tool0)
         impact_xyz = np.array([
             msg.impact_pose.position.x,
             msg.impact_pose.position.y,
@@ -213,22 +318,32 @@ class StrikePlanner(Node):
                 now_sec=self.get_clock().now().nanoseconds * 1e-9,
             )
 
-        # Keep per-strike displacement inside a reachable neighborhood around
-        # current pose; this prevents impossible IK requests from noisy targets.
-        xy_delta = impact_xyz[:2] - start_xyz[:2]
-        xy_norm = float(np.linalg.norm(xy_delta))
-        if xy_norm > self.max_xy_step and xy_norm > 1e-9:
-            impact_xyz[:2] = start_xyz[:2] + (xy_delta / xy_norm) * self.max_xy_step
+        if self.limit_target_step:
+            # Optional safety/testing mode: keep each strike inside a small
+            # neighborhood around the current paddle point.
+            xy_delta = impact_xyz[:2] - start_xyz[:2]
+            xy_norm = float(np.linalg.norm(xy_delta))
+            if xy_norm > self.max_xy_step and xy_norm > 1e-9:
+                impact_xyz[:2] = start_xyz[:2] + (xy_delta / xy_norm) * self.max_xy_step
 
-        min_allowed_z = start_xyz[2] - self.max_z_drop
-        if impact_xyz[2] < min_allowed_z:
-            impact_xyz[2] = min_allowed_z
+            min_allowed_z = start_xyz[2] - self.max_z_drop
+            if impact_xyz[2] < min_allowed_z:
+                impact_xyz[2] = min_allowed_z
 
-        if self.use_current_tool_orientation:
-            qx = tf.transform.rotation.x
-            qy = tf.transform.rotation.y
-            qz = tf.transform.rotation.z
-            qw = tf.transform.rotation.w
+        ball_velocity = np.array([
+            msg.ball_velocity_at_impact.x,
+            msg.ball_velocity_at_impact.y,
+            msg.ball_velocity_at_impact.z,
+        ], dtype=np.float64)
+        if self.orient_paddle_to_ball_velocity:
+            quat = _quat_with_tool_axis_aligned_to_vector(
+                self.paddle_normal_axis,
+                -ball_velocity,
+                tool_quat,
+            )
+            qx, qy, qz, qw = quat
+        elif self.use_current_tool_orientation:
+            qx, qy, qz, qw = tool_quat
         else:
             q = msg.impact_pose.orientation
             qx, qy, qz, qw = q.x, q.y, q.z, q.w
@@ -240,32 +355,56 @@ class StrikePlanner(Node):
         remaining_to_impact = predicted_tti - msg_age
         exec_time = remaining_to_impact - self.ik_budget
         if exec_time < self.min_exec_time:
+            if self.drop_late_targets:
+                self.get_logger().warn(
+                    f'target too late: predicted={predicted_tti:.3f}s age={msg_age:.3f}s '
+                    f'budget={self.ik_budget:.3f}s remaining_exec={exec_time:.3f}s'
+                )
+                return False
             self.get_logger().warn(
-                f'target too late: predicted={predicted_tti:.3f}s age={msg_age:.3f}s '
-                f'budget={self.ik_budget:.3f}s remaining_exec={exec_time:.3f}s'
+                f'target timing late; moving to strike pose anyway: '
+                f'predicted={predicted_tti:.3f}s age={msg_age:.3f}s '
+                f'budget={self.ik_budget:.3f}s remaining_exec={exec_time:.3f}s '
+                f'fallback_exec={self.late_target_exec_time:.3f}s'
             )
-            return
+            exec_time = max(self.min_exec_time, self.late_target_exec_time)
+            remaining_to_impact = exec_time + self.ik_budget
 
         build_start = time.monotonic()
-        cart_traj = LinearTrajectory(start_xyz, impact_xyz, exec_time)
+        cart_traj, final_paddle_xyz = self._make_cartesian_trajectory(
+            start_xyz,
+            impact_xyz,
+            exec_time,
+        )
         joint_traj = self._build_joint_trajectory(
             cart_traj, joint_state, qx, qy, qz, qw
         )
+        if joint_traj is None and self.fallback_to_current_orientation:
+            self.get_logger().warn(
+                'IK failed with desired paddle orientation; retrying with current tool orientation.'
+            )
+            qx, qy, qz, qw = tool_quat
+            joint_traj = self._build_joint_trajectory(
+                cart_traj, joint_state, qx, qy, qz, qw
+            )
         if joint_traj is None:
-            return
+            return False
 
         build_elapsed = time.monotonic() - build_start
         actual_remaining = remaining_to_impact - build_elapsed
         if actual_remaining < self.min_exec_time:
-            self.get_logger().warn(
-                f'IK finished too late: build={build_elapsed:.3f}s '
-                f'actual_remaining={actual_remaining:.3f}s'
-            )
-            return
+            if self.drop_late_targets:
+                self.get_logger().warn(
+                    f'IK finished too late: build={build_elapsed:.3f}s '
+                    f'actual_remaining={actual_remaining:.3f}s'
+                )
+                return False
+            actual_remaining = exec_time
 
         # If IK took longer than the reserved budget, begin partway through
-        # the trajectory so the final waypoint still aligns with impact time.
-        elapsed_offset = max(0.0, cart_traj.total_time - actual_remaining)
+        # the trajectory so the contact waypoint still aligns with impact time.
+        contact_time = getattr(cart_traj, 'contact_time', cart_traj.total_time)
+        elapsed_offset = max(0.0, contact_time - actual_remaining)
         active_start = self.get_clock().now() - RclpyDuration(seconds=elapsed_offset)
         with self._lock:
             self._active_traj = joint_traj
@@ -274,14 +413,46 @@ class StrikePlanner(Node):
             self._busy = True
         self.get_logger().info(
             f'Strike updated: {self.num_waypoints} waypoints over {exec_time:.2f}s '
-            f'(age={msg_age:.3f}s, IK={build_elapsed:.3f}s) from {start_xyz} to {impact_xyz}. '
+            f'(age={msg_age:.3f}s, IK={build_elapsed:.3f}s) '
+            f'paddle from {start_xyz} through {impact_xyz} to {final_paddle_xyz}. '
             f'limits: max_xy_step={self.max_xy_step:.3f}, max_z_drop={self.max_z_drop:.3f}'
         )
+        return True
 
     # ---------------------------------------------------------- trajectory build
 
+    def _make_cartesian_trajectory(self, start_xyz, impact_xyz, exec_time):
+        if not self.swing_through:
+            return LinearTrajectory(start_xyz, impact_xyz, exec_time), impact_xyz
+
+        direction = np.asarray(self.follow_through_direction, dtype=np.float64)
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-9:
+            self.get_logger().warn(
+                'follow_through_direction is near zero; falling back to +Z.',
+                throttle_duration_sec=5.0,
+            )
+            direction = np.array([0.0, 0.0, 1.0])
+        else:
+            direction = direction / norm
+
+        follow_xyz = impact_xyz + direction * self.follow_through_distance
+        total_time = exec_time + max(0.0, self.follow_through_duration)
+        if total_time <= exec_time + 1e-6:
+            return LinearTrajectory(start_xyz, impact_xyz, exec_time), impact_xyz
+
+        return (
+            PiecewiseLinearTrajectory(
+                times=[0.0, exec_time, total_time],
+                positions=[start_xyz, impact_xyz, follow_xyz],
+            ),
+            follow_xyz,
+        )
+
     def _build_joint_trajectory(self, cart_traj, joint_state, qx, qy, qz, qw):
         times = np.linspace(0.0, cart_traj.total_time, self.num_waypoints)
+        if hasattr(cart_traj, 'key_times'):
+            times = np.unique(np.concatenate([times, np.array(cart_traj.key_times)]))
         positions = []
         cart_points = [cart_traj.target_pose(t) for t in times]
         waypoint_quats = []
@@ -306,21 +477,28 @@ class StrikePlanner(Node):
             if i == len(times) - 1:
                 # Only final waypoint uses desired impact orientation.
                 req_qx, req_qy, req_qz, req_qw = qx, qy, qz, qw
-                sol = self.ik_planner.compute_ik(
-                    seed_state,
-                    pose[0], pose[1], pose[2],
-                    qx=req_qx, qy=req_qy, qz=req_qz, qw=req_qw,
-                    timeout_sec=self.ik_timeout,
-                )
             else:
-                # Intermediate waypoints favor translational feasibility.
-                req_qx, req_qy, req_qz, req_qw = 0.0, 0.0, 0.0, 1.0
-                sol = self.ik_planner.compute_ik(
-                    seed_state,
-                    pose[0], pose[1], pose[2],
-                    qx=req_qx, qy=req_qy, qz=req_qz, qw=req_qw,
-                    timeout_sec=self.ik_timeout,
-                )
+                # Keep the same tool orientation so the paddle offset maps
+                # consistently from contact point to IK link.
+                req_qx, req_qy, req_qz, req_qw = qx, qy, qz, qw
+            tool_pose = _paddle_to_tool_xyz(
+                pose[:3],
+                (req_qx, req_qy, req_qz, req_qw),
+                self.paddle_offset_tool0,
+            )
+            self.get_logger().info(
+                f'IK waypoint {i + 1}/{len(times)}: '
+                f'paddle=({pose[0]:.4f},{pose[1]:.4f},{pose[2]:.4f}) '
+                f'tool=({tool_pose[0]:.4f},{tool_pose[1]:.4f},{tool_pose[2]:.4f}) '
+                f'quat=({req_qx:.4f},{req_qy:.4f},{req_qz:.4f},{req_qw:.4f})'
+            )
+            sol = self.ik_planner.compute_ik(
+                seed_state,
+                tool_pose[0], tool_pose[1], tool_pose[2],
+                qx=req_qx, qy=req_qy, qz=req_qz, qw=req_qw,
+                ik_link_name=self.ik_link_name,
+                timeout_sec=self.ik_timeout,
+            )
             waypoint_quats.append((req_qx, req_qy, req_qz, req_qw))
             if sol is None:
                 waypoint_success[i] = False
@@ -372,18 +550,47 @@ class StrikePlanner(Node):
             joint_state = self.joint_state
 
         if not busy or active_traj is None or active_start is None or joint_state is None:
+            self._maybe_rearm_after_quiet()
             return
 
         elapsed = (self.get_clock().now() - active_start).nanoseconds * 1e-9
         total_time = _last_time(active_traj)
+        current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
 
         if elapsed >= total_time:
-            self._publish_velocity(np.zeros(6))
-            self.pid.integral_error = np.zeros(6)
-            with self._lock:
-                self._busy = False
-                self._active_traj = None
-            self.get_logger().info(f'Strike complete (t={elapsed:.2f}s).')
+            final_pos = np.array(active_traj.points[-1].positions)
+            final_vel = np.zeros(6)
+            pos_error = final_pos - current_pos
+            max_pos_error = float(np.max(np.abs(pos_error)))
+            max_vel = float(np.max(np.abs(current_vel)))
+
+            settled = (
+                max_pos_error <= self.settle_position_tolerance
+                and max_vel <= self.settle_velocity_tolerance
+            )
+            timed_out = (
+                self.settle_timeout > 0.0
+                and elapsed >= total_time + self.settle_timeout
+            )
+
+            if settled or timed_out:
+                self._publish_velocity(np.zeros(6))
+                self.pid.integral_error = np.zeros(6)
+                with self._lock:
+                    self._busy = False
+                    self._active_traj = None
+                if timed_out and not settled:
+                    self.get_logger().warn(
+                        f'Strike settle timeout (t={elapsed:.2f}s, '
+                        f'max_joint_error={max_pos_error:.3f} rad).'
+                    )
+                else:
+                    self.get_logger().info(f'Strike complete (t={elapsed:.2f}s).')
+                self._maybe_rearm_after_quiet()
+                return
+
+            cmd = self.pid.step_control(final_pos, final_vel, current_pos, current_vel)
+            self._publish_velocity(cmd)
             return
 
         target_pos, target_vel, next_index = _interpolate(
@@ -392,10 +599,22 @@ class StrikePlanner(Node):
         with self._lock:
             if self._active_traj is active_traj:
                 self._interp_index = next_index
-        current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
-
         cmd = self.pid.step_control(target_pos, target_vel, current_pos, current_vel)
         self._publish_velocity(cmd)
+
+    def _maybe_rearm_after_quiet(self):
+        if not self.one_swing_per_target_burst:
+            return
+        now_mono = time.monotonic()
+        with self._lock:
+            if self._strike_armed or self._busy or self._planning:
+                return
+            if self._last_target_rx_time is None:
+                return
+            if now_mono - self._last_target_rx_time < self.rearm_quiet_time:
+                return
+            self._strike_armed = True
+        self.get_logger().info('Strike re-armed after target stream went quiet.')
 
     def _publish_velocity(self, cmd):
         msg = Float64MultiArray()
@@ -582,6 +801,74 @@ def _current_joint_summary(joint_state: JointState, order):
     return ', '.join(values)
 
 
+def _tool_to_paddle_xyz(tool_xyz, tool_quat, paddle_offset_tool0):
+    return np.asarray(tool_xyz, dtype=np.float64) + (
+        _quat_to_rot(*tool_quat) @ np.asarray(paddle_offset_tool0, dtype=np.float64)
+    )
+
+
+def _paddle_to_tool_xyz(paddle_xyz, tool_quat, paddle_offset_tool0):
+    return np.asarray(paddle_xyz, dtype=np.float64) - (
+        _quat_to_rot(*tool_quat) @ np.asarray(paddle_offset_tool0, dtype=np.float64)
+    )
+
+
+def _quat_with_tool_axis_aligned_to_vector(axis_name, target_vector, fallback_quat):
+    target = np.asarray(target_vector, dtype=np.float64)
+    target_norm = float(np.linalg.norm(target))
+    if target_norm < 1e-6:
+        return fallback_quat
+    target = target / target_norm
+
+    local_axis = _axis_name_to_vector(axis_name)
+    if local_axis is None:
+        return fallback_quat
+
+    # Pick a local secondary axis and a world reference to resolve wrist roll.
+    secondary_local = np.array([0.0, 0.0, 1.0])
+    world_ref = np.array([0.0, 0.0, 1.0])
+    if abs(float(np.dot(local_axis, secondary_local))) > 0.9:
+        secondary_local = np.array([1.0, 0.0, 0.0])
+    if abs(float(np.dot(target, world_ref))) > 0.9:
+        world_ref = np.array([1.0, 0.0, 0.0])
+
+    local_secondary = _orthogonal_unit(secondary_local, local_axis)
+    world_secondary = _orthogonal_unit(world_ref, target)
+
+    local_third = np.cross(local_axis, local_secondary)
+    world_third = np.cross(target, world_secondary)
+
+    local_basis = np.column_stack((local_axis, local_secondary, local_third))
+    world_basis = np.column_stack((target, world_secondary, world_third))
+    rot = world_basis @ local_basis.T
+    return _rot_to_quat(rot)
+
+
+def _axis_name_to_vector(axis_name):
+    axes = {
+        'x': np.array([1.0, 0.0, 0.0]),
+        '+x': np.array([1.0, 0.0, 0.0]),
+        '-x': np.array([-1.0, 0.0, 0.0]),
+        'y': np.array([0.0, 1.0, 0.0]),
+        '+y': np.array([0.0, 1.0, 0.0]),
+        '-y': np.array([0.0, -1.0, 0.0]),
+        'z': np.array([0.0, 0.0, 1.0]),
+        '+z': np.array([0.0, 0.0, 1.0]),
+        '-z': np.array([0.0, 0.0, -1.0]),
+    }
+    return axes.get(str(axis_name).lower())
+
+
+def _orthogonal_unit(reference, normal):
+    projected = np.asarray(reference, dtype=np.float64) - (
+        float(np.dot(reference, normal)) * np.asarray(normal, dtype=np.float64)
+    )
+    norm = float(np.linalg.norm(projected))
+    if norm < 1e-9:
+        return np.array([1.0, 0.0, 0.0])
+    return projected / norm
+
+
 def _finite_diff(positions, times):
     n = len(times)
     velocities = np.zeros_like(positions)
@@ -650,6 +937,39 @@ def _quat_to_rot(x, y, z, w):
         [    2*(x*y + w*z), 1 - 2*(x*x + z*z),     2*(y*z - w*x)],
         [    2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x*x + y*y)],
     ])
+
+
+def _rot_to_quat(rot):
+    """3x3 rotation matrix -> quaternion (x, y, z, w)."""
+    m = np.asarray(rot, dtype=np.float64)
+    trace = float(np.trace(m))
+    if trace > 0.0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        qw = 0.25 / s
+        qx = (m[2, 1] - m[1, 2]) * s
+        qy = (m[0, 2] - m[2, 0]) * s
+        qz = (m[1, 0] - m[0, 1]) * s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * np.sqrt(max(0.0, 1.0 + m[0, 0] - m[1, 1] - m[2, 2]))
+        qw = (m[2, 1] - m[1, 2]) / s
+        qx = 0.25 * s
+        qy = (m[0, 1] + m[1, 0]) / s
+        qz = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * np.sqrt(max(0.0, 1.0 + m[1, 1] - m[0, 0] - m[2, 2]))
+        qw = (m[0, 2] - m[2, 0]) / s
+        qx = (m[0, 1] + m[1, 0]) / s
+        qy = 0.25 * s
+        qz = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(max(0.0, 1.0 + m[2, 2] - m[0, 0] - m[1, 1]))
+        qw = (m[1, 0] - m[0, 1]) / s
+        qx = (m[0, 2] + m[2, 0]) / s
+        qy = (m[1, 2] + m[2, 1]) / s
+        qz = 0.25 * s
+    quat = np.array([qx, qy, qz, qw], dtype=np.float64)
+    quat /= max(1e-12, float(np.linalg.norm(quat)))
+    return tuple(quat.tolist())
 
 
 def main(args=None):
