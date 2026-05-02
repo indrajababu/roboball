@@ -144,7 +144,8 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'num_waypoints': 5,
-            'limit_target_step': False,
+            'limit_target_step': True,
+            'max_z_rise': 0.06,
             'drop_late_targets': False,
             'late_target_exec_time': 1.5,
             'swing_through': True,
@@ -160,7 +161,7 @@ def generate_launch_description():
             'ik_timeout': 0.15,
             'ee_frame': 'tool0',
             'ik_link_name': 'tool0',
-            'orient_paddle_to_ball_velocity': True,
+            'orient_paddle_to_ball_velocity': False,
             'fallback_to_current_orientation': True,
             # The paddle face lies in tool0's ZX plane, so its normal is +/-Y.
             # Use -Y so the striking face points opposite incoming ball motion.

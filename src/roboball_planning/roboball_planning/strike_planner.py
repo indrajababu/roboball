@@ -103,10 +103,11 @@ class StrikePlanner(Node):
         self.paddle_normal_axis = str(
             self.declare_parameter('paddle_normal_axis', '-y').value
         )
-        self.num_waypoints = int(self.declare_parameter('num_waypoints', NUM_WAYPOINTS).value)
-        self.limit_target_step = bool(self.declare_parameter('limit_target_step', False).value)
+        self.num_waypoints = int(self.declare_parameter('num_waypoints', 5).value)
+        self.limit_target_step = bool(self.declare_parameter('limit_target_step', True).value)
         self.max_xy_step = float(self.declare_parameter('max_xy_step', 0.12).value)
         self.max_z_drop = float(self.declare_parameter('max_z_drop', 0.02).value)
+        self.max_z_rise = float(self.declare_parameter('max_z_rise', 0.06).value)
         self.min_exec_time = float(self.declare_parameter('min_exec_time', 0.12).value)
         self.drop_late_targets = bool(self.declare_parameter('drop_late_targets', False).value)
         self.late_target_exec_time = float(
@@ -219,6 +220,7 @@ class StrikePlanner(Node):
         self._interp_index = 0
         self._busy = False
         self._planning = False
+        self._pending_target = None
         self._strike_armed = True
         self._last_target_rx_time = None
         self._lock = threading.Lock()
@@ -240,6 +242,7 @@ class StrikePlanner(Node):
             f'swing_through={self.swing_through}, '
             f'follow_through_distance={self.follow_through_distance:.3f}m, '
             f'follow_through_duration={self.follow_through_duration:.2f}s. '
+            f'max_z_rise={self.max_z_rise:.3f}m. '
             f'one_swing_per_target_burst={self.one_swing_per_target_burst}, '
             f'rearm_quiet_time={self.rearm_quiet_time:.2f}s. '
             f'orient_paddle_to_ball_velocity={self.orient_paddle_to_ball_velocity}, '
@@ -258,35 +261,37 @@ class StrikePlanner(Node):
             self.joint_state = msg
 
     def _on_target(self, msg: StrikeTarget):
-        now_mono = time.monotonic()
-        with self._lock:
-            self._last_target_rx_time = now_mono
-            if self.one_swing_per_target_burst and not self._strike_armed:
-                self.get_logger().debug('Strike disarmed until target stream goes quiet.')
-                return
-            if self._busy:
-                self.get_logger().debug('Strike already active, dropping superseded target.')
-                return
-            if self._planning:
-                self.get_logger().debug('IK build in progress, dropping superseded target.')
-                return
-            self._planning = True
-            joint_state = self.joint_state
-
-        if joint_state is None:
+        target_msg = msg
+        while target_msg is not None:
+            now_mono = time.monotonic()
             with self._lock:
-                self._planning = False
-            self.get_logger().warn('No joint state yet, dropping target.')
-            return
+                self._last_target_rx_time = now_mono
+                active_retarget = self._busy
+                if self.one_swing_per_target_burst and not self._strike_armed and not active_retarget:
+                    self.get_logger().debug('Strike disarmed until target stream goes quiet.')
+                    return
+                if self._planning:
+                    self._pending_target = target_msg
+                    self.get_logger().debug('IK build in progress; keeping latest target pending.')
+                    return
+                self._planning = True
+                self._pending_target = None
+                joint_state = self.joint_state
 
-        try:
-            accepted = self._plan_target(msg, joint_state)
-            if accepted and self.one_swing_per_target_burst:
-                with self._lock:
+            accepted = False
+            if joint_state is None:
+                self.get_logger().warn('No joint state yet, dropping target.')
+            else:
+                accepted = self._plan_target(target_msg, joint_state)
+
+            with self._lock:
+                if accepted and self.one_swing_per_target_burst:
                     self._strike_armed = False
-        finally:
-            with self._lock:
                 self._planning = False
+                target_msg = self._pending_target
+                self._pending_target = None
+                if target_msg is not None:
+                    self.get_logger().debug('Planning latest pending target.')
 
     def _plan_target(self, msg: StrikeTarget, joint_state: JointState):
         try:
@@ -329,6 +334,9 @@ class StrikePlanner(Node):
             min_allowed_z = start_xyz[2] - self.max_z_drop
             if impact_xyz[2] < min_allowed_z:
                 impact_xyz[2] = min_allowed_z
+            max_allowed_z = start_xyz[2] + self.max_z_rise
+            if impact_xyz[2] > max_allowed_z:
+                impact_xyz[2] = max_allowed_z
 
         ball_velocity = np.array([
             msg.ball_velocity_at_impact.x,
@@ -411,11 +419,13 @@ class StrikePlanner(Node):
             self._active_start = active_start
             self._interp_index = 0
             self._busy = True
+            self.pid.integral_error = np.zeros(6)
         self.get_logger().info(
             f'Strike updated: {self.num_waypoints} waypoints over {exec_time:.2f}s '
             f'(age={msg_age:.3f}s, IK={build_elapsed:.3f}s) '
             f'paddle from {start_xyz} through {impact_xyz} to {final_paddle_xyz}. '
-            f'limits: max_xy_step={self.max_xy_step:.3f}, max_z_drop={self.max_z_drop:.3f}'
+            f'limits: max_xy_step={self.max_xy_step:.3f}, '
+            f'max_z_drop={self.max_z_drop:.3f}, max_z_rise={self.max_z_rise:.3f}'
         )
         return True
 

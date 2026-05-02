@@ -38,12 +38,12 @@ HOME_JOINT_NAMES = [
 # Home pose copied from the known-good joint-space state you pasted.
 # This is NOT an IK target. These are direct joint angles in radians.
 HOME_POSITIONS = [
-    -2.9633223019041957,  # shoulder_lift_joint
-    -1.7467526197433472,  # elbow_joint
-    1.5880986887165527,   # wrist_1_joint
-    1.5541517734527588,   # wrist_2_joint
-    -4.671005074177877,   # wrist_3_joint
-    3.1735517978668213,   # shoulder_pan_joint
+    -2.316411157647604,   # shoulder_lift_joint
+    -1.810107946395874,   # elbow_joint
+    1.0502943235584716,   # wrist_1_joint
+    2.0732617378234863,   # wrist_2_joint
+    -1.5386202971087855,  # wrist_3_joint
+    5.799105644226074,    # shoulder_pan_joint
 ]
 
 
@@ -64,6 +64,9 @@ class GoHome(Node):
                 "No subscriber yet. Is validate_trajectory running?"
             )
             time.sleep(0.5)
+
+        # Wait for DDS to fully establish the connection before publishing.
+        time.sleep(0.5)
 
         traj = JointTrajectory()
         traj.header.stamp = self.get_clock().now().to_msg()
