@@ -111,18 +111,36 @@ class StrikePlanner(Node):
         self.min_exec_time = float(self.declare_parameter('min_exec_time', 0.12).value)
         self.drop_late_targets = bool(self.declare_parameter('drop_late_targets', False).value)
         self.late_target_exec_time = float(
-            self.declare_parameter('late_target_exec_time', 1.5).value
+            self.declare_parameter('late_target_exec_time', 0.5).value
         )
         self.swing_through = bool(self.declare_parameter('swing_through', True).value)
         self.follow_through_distance = float(
-            self.declare_parameter('follow_through_distance', 0.04).value
+            self.declare_parameter('follow_through_distance', 0.22).value
         )
         self.follow_through_duration = float(
-            self.declare_parameter('follow_through_duration', 1.0).value
+            self.declare_parameter('follow_through_duration', 0.045).value
         )
         self.follow_through_direction = np.array(
             self.declare_parameter('follow_through_direction', [0.0, 0.0, 1.0]).value,
             dtype=np.float64,
+        )
+        self.recover_after_follow_through = bool(
+            self.declare_parameter('recover_after_follow_through', True).value
+        )
+        self.match_recovery_to_follow_through = bool(
+            self.declare_parameter('match_recovery_to_follow_through', True).value
+        )
+        self.recovery_distance = float(
+            self.declare_parameter('recovery_distance', 0.22).value
+        )
+        self.recovery_duration = float(
+            self.declare_parameter('recovery_duration', 0.045).value
+        )
+        if self.match_recovery_to_follow_through:
+            self.recovery_distance = self.follow_through_distance
+            self.recovery_duration = self.follow_through_duration
+        self.sharp_piecewise_velocities = bool(
+            self.declare_parameter('sharp_piecewise_velocities', True).value
         )
         self.one_swing_per_target_burst = bool(
             self.declare_parameter('one_swing_per_target_burst', True).value
@@ -242,6 +260,11 @@ class StrikePlanner(Node):
             f'swing_through={self.swing_through}, '
             f'follow_through_distance={self.follow_through_distance:.3f}m, '
             f'follow_through_duration={self.follow_through_duration:.2f}s. '
+            f'recover_after_follow_through={self.recover_after_follow_through}, '
+            f'match_recovery_to_follow_through={self.match_recovery_to_follow_through}, '
+            f'recovery_distance={self.recovery_distance:.3f}m, '
+            f'recovery_duration={self.recovery_duration:.2f}s. '
+            f'sharp_piecewise_velocities={self.sharp_piecewise_velocities}. '
             f'max_z_rise={self.max_z_rise:.3f}m. '
             f'one_swing_per_target_burst={self.one_swing_per_target_burst}, '
             f'rearm_quiet_time={self.rearm_quiet_time:.2f}s. '
@@ -447,16 +470,29 @@ class StrikePlanner(Node):
             direction = direction / norm
 
         follow_xyz = impact_xyz + direction * self.follow_through_distance
-        total_time = exec_time + max(0.0, self.follow_through_duration)
-        if total_time <= exec_time + 1e-6:
+        follow_duration = max(0.0, self.follow_through_duration)
+        follow_time = exec_time + follow_duration
+        if follow_time <= exec_time + 1e-6:
             return LinearTrajectory(start_xyz, impact_xyz, exec_time), impact_xyz
+
+        times = [0.0, exec_time, follow_time]
+        positions = [start_xyz, impact_xyz, follow_xyz]
+        final_xyz = follow_xyz
+
+        recovery_duration = max(0.0, self.recovery_duration)
+        if self.recover_after_follow_through and recovery_duration > 1e-6:
+            recovery_xyz = follow_xyz - direction * self.recovery_distance
+            recovery_time = follow_time + recovery_duration
+            times.append(recovery_time)
+            positions.append(recovery_xyz)
+            final_xyz = recovery_xyz
 
         return (
             PiecewiseLinearTrajectory(
-                times=[0.0, exec_time, total_time],
-                positions=[start_xyz, impact_xyz, follow_xyz],
+                times=times,
+                positions=positions,
             ),
-            follow_xyz,
+            final_xyz,
         )
 
     def _build_joint_trajectory(self, cart_traj, joint_state, qx, qy, qz, qw):
@@ -536,7 +572,10 @@ class StrikePlanner(Node):
         )
 
         positions = np.array(positions)
-        velocities = _finite_diff(positions, times)
+        if self.sharp_piecewise_velocities and hasattr(cart_traj, 'key_times'):
+            velocities = _piecewise_segment_velocities(positions, times)
+        else:
+            velocities = _finite_diff(positions, times)
 
         joint_traj = JointTrajectory()
         joint_traj.joint_names = list(JOINT_ORDER)
@@ -888,6 +927,22 @@ def _finite_diff(positions, times):
     velocities[-1] = (positions[-1] - positions[-2]) / (times[-1] - times[-2])
     for i in range(1, n - 1):
         velocities[i] = (positions[i + 1] - positions[i - 1]) / (times[i + 1] - times[i - 1])
+    return velocities
+
+
+def _piecewise_segment_velocities(positions, times):
+    n = len(times)
+    velocities = np.zeros_like(positions)
+    if n < 2:
+        return velocities
+    segment_velocities = []
+    for i in range(n - 1):
+        dt = max(1e-6, float(times[i + 1] - times[i]))
+        segment_velocities.append((positions[i + 1] - positions[i]) / dt)
+    velocities[0] = segment_velocities[0]
+    for i in range(1, n - 1):
+        velocities[i] = segment_velocities[i]
+    velocities[-1] = segment_velocities[-1]
     return velocities
 
 
