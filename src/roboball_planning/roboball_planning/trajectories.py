@@ -180,6 +180,7 @@ class LinearTrajectory(Trajectory):
 
         self.start_position = np.array(start_position)
         self.goal_position = np.array(goal_position)
+        self.goal_position[2] = self.start_position[2]
 
         # Calculate trajectory parameters
         self.direction = self.goal_position - self.start_position
@@ -376,9 +377,9 @@ def define_trajectories(args):
 
     trajectory = None
     if args.task == 'line':
-        # Example linear trajectory
+        # Example horizontal-only linear trajectory.
         start = np.array([0.3, 0.2, 0.3])
-        goal = np.array([0.5, 0.4, 0.4])
+        goal = np.array([0.5, 0.4, 0.3])
         total_time = 5.0
         trajectory = LinearTrajectory(start, goal, total_time)
     elif args.task == 'circle':

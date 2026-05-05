@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Horizontal ball tracker with one bounded vertical pop."""
+"""Continuous horizontal ball tracker with one bounded vertical pop per cycle."""
 
 import subprocess
 import threading
@@ -38,7 +38,7 @@ DEFAULT_BALL_TO_PADDLE_OFFSET = [-0.082, 0.094, 0.116]
 
 
 class HorizontalPopTracker(Node):
-    """Keep the paddle at fixed height except for a single 6 inch pop."""
+    """Track ball XY at a locked height, popping once when the ball gets close."""
 
     TRACK = 'track'
     POP = 'pop'
@@ -53,6 +53,10 @@ class HorizontalPopTracker(Node):
             float(self.declare_parameter('pop_height', 6.0 * INCH_TO_M).value),
             6.0 * INCH_TO_M,
         )
+        self.max_vertical_rise = min(
+            float(self.declare_parameter('max_vertical_rise', 6.0 * INCH_TO_M).value),
+            6.0 * INCH_TO_M,
+        )
         self.pop_trigger_clearance = float(
             self.declare_parameter('pop_trigger_clearance', 10.0 * INCH_TO_M).value
         )
@@ -60,10 +64,10 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('pop_hold_duration', 0.10).value
         )
         self.recovery_duration = float(
-            self.declare_parameter('recovery_duration', 0.05).value
+            self.declare_parameter('recovery_duration', 0.20).value
         )
         self.pop_rearm_hysteresis = float(
-            self.declare_parameter('pop_rearm_hysteresis', 0.08).value
+            self.declare_parameter('pop_rearm_hysteresis', 0.02).value
         )
         self.lock_contact_height = bool(
             self.declare_parameter('lock_contact_height', True).value
@@ -87,6 +91,12 @@ class HorizontalPopTracker(Node):
         )
         self.ball_timeout = float(self.declare_parameter('ball_timeout', 0.35).value)
         self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.06).value)
+        self.max_joint_speed = float(
+            self.declare_parameter('max_joint_speed', 1.0).value
+        )
+        self.max_ik_joint_delta = float(
+            self.declare_parameter('max_ik_joint_delta', np.pi / 4.0).value
+        )
         self.ee_frame = str(self.declare_parameter('ee_frame', EE_FRAME).value)
         self.ik_link_name = str(self.declare_parameter('ik_link_name', IK_LINK_NAME).value)
         self.paddle_offset_tool0 = np.array(
@@ -111,10 +121,17 @@ class HorizontalPopTracker(Node):
             dtype=np.float64,
         )
 
-        Kp = 0.2 * np.array([0.4, 2.0, 1.7, 1.5, 2.0, 2.0])
+        Kp = 0.2 * np.array([2.0, 2.0, 1.7, 1.5, 2.0, 2.0])
         Kd = 0.01 * np.array([2.0, 1.0, 2.0, 0.5, 0.8, 0.8])
         Ki = 0.01 * np.array([1.4, 1.4, 1.4, 1.0, 0.6, 0.6])
-        self.pid = PIDJointVelocityController(self, Kp, Ki, Kd)
+        self.pid = PIDJointVelocityController(
+            self,
+            Kp,
+            Ki,
+            Kd,
+            dt=self.control_period,
+            max_integral_error=0.5,
+        )
         self.ik_planner = IKPlanner()
 
         self.tf_buffer = Buffer()
@@ -131,6 +148,7 @@ class HorizontalPopTracker(Node):
         self._recover_start_time = None
         self._pop_armed = True
         self._last_pop_time = -1e9
+        self._ceiling_active = False
         self._lock = threading.Lock()
         self._tick_lock = threading.Lock()
 
@@ -166,12 +184,15 @@ class HorizontalPopTracker(Node):
 
         self.get_logger().info(
             f'Horizontal pop tracker up. pop_height={self.pop_height:.3f}m, '
+            f'max_vertical_rise={self.max_vertical_rise:.3f}m, '
             f'pop_trigger_clearance={self.pop_trigger_clearance:.3f}m, '
             f'pop_hold_duration={self.pop_hold_duration:.3f}s, '
             f'recovery_duration={self.recovery_duration:.3f}s, '
             f'lock_contact_height={self.lock_contact_height}, '
             f'contact_height={self.contact_height}, '
-            f'min_body_clearance_radius={self.min_body_clearance_radius:.3f}m. '
+            f'min_body_clearance_radius={self.min_body_clearance_radius:.3f}m, '
+            f'max_joint_speed={self.max_joint_speed:.3f}rad/s, '
+            f'max_ik_joint_delta={self.max_ik_joint_delta:.3f}rad. '
             'Z target is fixed except during the bounded pop.'
         )
 
@@ -237,6 +258,11 @@ class HorizontalPopTracker(Node):
             self._locked_tool_quat = tool_quat
 
         now_mono = time.monotonic()
+        over_ceiling = self._enforce_vertical_ceiling(
+            now_mono=now_mono,
+            current_paddle_z=float(current_paddle_xyz[2]),
+        )
+
         ball_valid = (
             ball_state is not None
             and ball_state.fit_valid
@@ -253,11 +279,6 @@ class HorizontalPopTracker(Node):
                 ball_state.position.y,
                 ball_state.position.z,
             ], dtype=np.float64)
-            ball_vel = np.array([
-                ball_state.velocity.x,
-                ball_state.velocity.y,
-                ball_state.velocity.z,
-            ], dtype=np.float64)
             target_xy = (
                 ball_pos[:2]
                 - self.ball_to_paddle_offset[:2]
@@ -268,11 +289,11 @@ class HorizontalPopTracker(Node):
                 self.min_body_clearance_radius,
             )
             self._last_target_xy = target_xy.copy()
-            self._update_pop_state(now_mono, ball_pos, ball_vel)
+            self._update_pop_state(now_mono, ball_pos)
         else:
             self._finish_pop_state_without_ball(now_mono)
 
-        target_z = self._target_paddle_z(now_mono)
+        target_z = self._target_paddle_z(now_mono, over_ceiling=over_ceiling)
         target_paddle_xyz = np.array([
             target_xy[0],
             target_xy[1],
@@ -303,22 +324,37 @@ class HorizontalPopTracker(Node):
 
         current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
         target_pos = _reorder_positions(ik_solution, JOINT_ORDER)
+        target_delta = _shortest_joint_delta(target_pos, current_pos)
+        max_delta = float(np.max(np.abs(target_delta)))
+        if max_delta > self.max_ik_joint_delta:
+            self.get_logger().warn(
+                f'Rejecting IK branch jump: max_joint_delta={max_delta:.3f}rad '
+                f'> limit={self.max_ik_joint_delta:.3f}rad.',
+                throttle_duration_sec=1.0,
+            )
+            self.pid.integral_error = np.zeros(6)
+            self._publish_velocity(np.zeros(6))
+            return
+        target_pos = current_pos + target_delta
         target_vel = np.zeros(6)
         cmd = self.pid.step_control(target_pos, target_vel, current_pos, current_vel)
+        cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
         self._publish_velocity(cmd)
 
-    def _update_pop_state(self, now_mono, ball_pos, ball_vel):
+    def _update_pop_state(self, now_mono, ball_pos):
         ball_clearance = float(ball_pos[2] - self._nominal_paddle_z)
         if not self._pop_armed:
             rearm_clearance = self.pop_trigger_clearance + self.pop_rearm_hysteresis
-            if ball_clearance >= rearm_clearance or ball_vel[2] > 0.05:
+            if ball_clearance >= rearm_clearance:
                 self._pop_armed = True
+                self.get_logger().info(
+                    f'POP re-armed: ball_clearance={ball_clearance:.3f}m.'
+                )
 
         if self._state == self.TRACK:
             ready_by_height = ball_clearance <= self.pop_trigger_clearance
-            ready_by_velocity = ball_vel[2] <= self.descending_velocity_threshold
             ready_by_time = now_mono - self._last_pop_time >= self.min_pop_interval
-            if self._pop_armed and ready_by_height and ready_by_velocity and ready_by_time:
+            if self._pop_armed and ready_by_height and ready_by_time:
                 self._state = self.POP
                 self._pop_start_time = now_mono
                 self._pop_armed = False
@@ -358,9 +394,34 @@ class HorizontalPopTracker(Node):
             self._recover_start_time = None
             self.pid.integral_error = np.zeros(6)
 
-    def _target_paddle_z(self, now_mono):
+    def _enforce_vertical_ceiling(self, now_mono, current_paddle_z):
+        ceiling_z = self._nominal_paddle_z + self.max_vertical_rise
+        if current_paddle_z < ceiling_z:
+            self._ceiling_active = False
+            return False
+
+        if not self._ceiling_active:
+            self.get_logger().warn(
+                f'Vertical ceiling hit: paddle_z={current_paddle_z:.3f}m '
+                f'>= ceiling_z={ceiling_z:.3f}m. Forcing recovery to '
+                f'{self._nominal_paddle_z:.3f}m.',
+                throttle_duration_sec=0.5,
+            )
+        self._ceiling_active = True
+        if self._state != self.RECOVER:
+            self._state = self.RECOVER
+            self._recover_start_time = now_mono
+            self.pid.integral_error = np.zeros(6)
+        return True
+
+    def _target_paddle_z(self, now_mono, over_ceiling=False):
+        if over_ceiling:
+            return self._nominal_paddle_z
         if self._state == self.POP:
-            return self._nominal_paddle_z + self.pop_height
+            return min(
+                self._nominal_paddle_z + self.pop_height,
+                self._nominal_paddle_z + self.max_vertical_rise,
+            )
         return self._nominal_paddle_z
 
     def _publish_velocity(self, cmd):
@@ -413,6 +474,14 @@ def _current_joint_vector(joint_state, order):
     pos = np.array([name_to_pos[n] for n in order], dtype=np.float64)
     vel = np.array([name_to_vel.get(n, 0.0) for n in order], dtype=np.float64)
     return pos, vel
+
+
+def _shortest_joint_delta(target_pos, current_pos):
+    delta = np.asarray(target_pos, dtype=np.float64) - np.asarray(
+        current_pos,
+        dtype=np.float64,
+    )
+    return (delta + np.pi) % (2.0 * np.pi) - np.pi
 
 
 def _tool_to_paddle_xyz(tool_xyz, tool_quat, paddle_offset_tool0):

@@ -132,7 +132,7 @@ class PIDJointVelocityController(Controller):
     Uses proportional, integral, and derivative gains to correct position and velocity errors.
     """
 
-    def __init__(self, node, Kp, Ki, Kd):
+    def __init__(self, node, Kp, Ki, Kd, dt=0.1, max_integral_error=None):
         """
         Parameters
         ----------
@@ -144,6 +144,10 @@ class PIDJointVelocityController(Controller):
             Integral gains (6x1)
         Kd: np.ndarray or list
             Derivative gains (6x1)
+        dt: float
+            Control period used for integral accumulation
+        max_integral_error: float or None
+            Optional anti-windup clamp for each joint's integral error
         """
 
         super().__init__(node)
@@ -151,6 +155,8 @@ class PIDJointVelocityController(Controller):
         self.Kp = np.array(Kp)
         self.Ki = np.array(Ki)
         self.Kd = np.array(Kd)
+        self.dt = float(dt)
+        self.max_integral_error = max_integral_error
         # Accumulated position error for the integral term
         self.integral_error = np.zeros(6)
 
@@ -185,14 +191,14 @@ class PIDJointVelocityController(Controller):
             Commanded joint velocities
         """
 
-        # dt matches the 10 Hz control loop timer period
-        dt = 0.1
-
         position_error = target_position - current_position
         velocity_error = target_velocity - current_velocity
 
         # Accumulate integral of position error over time
-        self.integral_error += position_error * dt
+        self.integral_error += position_error * self.dt
+        if self.max_integral_error is not None:
+            limit = abs(float(self.max_integral_error))
+            self.integral_error = np.clip(self.integral_error, -limit, limit)
 
         u = (target_velocity
              + self.Kp * position_error

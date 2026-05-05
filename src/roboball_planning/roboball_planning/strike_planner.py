@@ -63,7 +63,7 @@ IK_LINK_NAME = 'tool0'
 GRAVITY = 9.81
 INCH_TO_M = 0.0254
 DEFAULT_PADDLE_OFFSET_TOOL0 = [0.0, 0.0, 7.0 * INCH_TO_M]
-MAX_POP_FOLLOW_THROUGH_M = 6.0 * INCH_TO_M
+MAX_POP_FOLLOW_THROUGH_M = 0.0
 DEFAULT_POP_TRIGGER_CLEARANCE_M = 10.0 * INCH_TO_M
 
 
@@ -110,10 +110,12 @@ class StrikePlanner(Node):
         self.limit_target_step = bool(self.declare_parameter('limit_target_step', True).value)
         self.max_xy_step = float(self.declare_parameter('max_xy_step', 0.12).value)
         self.max_z_drop = float(self.declare_parameter('max_z_drop', 0.02).value)
-        self.max_z_rise = float(self.declare_parameter('max_z_rise', 0.06).value)
-        self.lock_contact_height = bool(
+        requested_max_z_rise = float(self.declare_parameter('max_z_rise', 0.0).value)
+        self.max_z_rise = 0.0
+        requested_lock_contact_height = bool(
             self.declare_parameter('lock_contact_height', True).value
         )
+        self.lock_contact_height = True
         configured_contact_height = float(
             self.declare_parameter('contact_height', float('nan')).value
         )
@@ -142,10 +144,11 @@ class StrikePlanner(Node):
         self.late_target_exec_time = float(
             self.declare_parameter('late_target_exec_time', 0.5).value
         )
-        self.swing_through = bool(self.declare_parameter('swing_through', True).value)
-        self.follow_through_distance = float(
-            self.declare_parameter('follow_through_distance', 0.44).value
+        requested_swing_through = bool(
+            self.declare_parameter('swing_through', False).value
         )
+        self.swing_through = False
+        self.follow_through_distance = 0.0
         self.max_follow_through_distance = float(
             self.declare_parameter(
                 'max_follow_through_distance',
@@ -159,25 +162,42 @@ class StrikePlanner(Node):
                 f'{self.max_follow_through_distance:.3f}m.'
             )
             self.follow_through_distance = self.max_follow_through_distance
-        self.follow_through_duration = float(
-            self.declare_parameter('follow_through_duration', 0.045).value
-        )
+        self.follow_through_duration = 0.0
         self.follow_through_direction = np.array(
-            self.declare_parameter('follow_through_direction', [0.0, 0.0, 1.0]).value,
+            self.declare_parameter('follow_through_direction', [0.0, 0.0, 0.0]).value,
             dtype=np.float64,
         )
-        self.vertical_pop_only = bool(
-            self.declare_parameter('vertical_pop_only', True).value
+        requested_vertical_pop_only = bool(
+            self.declare_parameter('vertical_pop_only', False).value
         )
+        self.vertical_pop_only = False
+        if not requested_lock_contact_height:
+            self.get_logger().warn(
+                'lock_contact_height:=false requested, but vertical motion is '
+                'disabled; forcing locked contact height.'
+            )
+        if requested_max_z_rise > 0.0:
+            self.get_logger().warn(
+                'max_z_rise > 0 requested, but extra upward motion is disabled; '
+                'forcing max_z_rise=0.'
+            )
+        if requested_swing_through:
+            self.get_logger().warn(
+                'swing_through:=true requested, but extra upward follow-through '
+                'is disabled.'
+            )
+        if requested_vertical_pop_only:
+            self.get_logger().warn(
+                'vertical_pop_only:=true requested, but extra vertical pop '
+                'behavior is disabled in strike_planner.'
+            )
         self.recover_after_follow_through = bool(
             self.declare_parameter('recover_after_follow_through', True).value
         )
         self.match_recovery_to_follow_through = bool(
             self.declare_parameter('match_recovery_to_follow_through', True).value
         )
-        self.recovery_distance = float(
-            self.declare_parameter('recovery_distance', 0.22).value
-        )
+        self.recovery_distance = 0.0
         self.recovery_duration = float(
             self.declare_parameter('recovery_duration', 0.045).value
         )
@@ -602,19 +622,30 @@ class StrikePlanner(Node):
     # ---------------------------------------------------------- trajectory build
 
     def _make_cartesian_trajectory(self, start_xyz, impact_xyz, exec_time):
+        start_xyz = np.asarray(start_xyz, dtype=np.float64).copy()
+        impact_xyz = np.asarray(impact_xyz, dtype=np.float64).copy()
+        if self.lock_contact_height:
+            locked_z = (
+                self._nominal_paddle_z
+                if self._nominal_paddle_z is not None
+                else start_xyz[2]
+            )
+            start_xyz[2] = locked_z
+            impact_xyz[2] = locked_z
+
         if not self.swing_through:
             return LinearTrajectory(start_xyz, impact_xyz, exec_time), impact_xyz
 
         direction = np.asarray(self.follow_through_direction, dtype=np.float64)
         if self.vertical_pop_only:
-            direction = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            direction = np.array([0.0, 0.0, 0.0], dtype=np.float64)
         norm = float(np.linalg.norm(direction))
         if norm < 1e-9:
             self.get_logger().warn(
-                'follow_through_direction is near zero; falling back to +Z.',
+                'follow_through_direction is near zero; disabling follow-through.',
                 throttle_duration_sec=5.0,
             )
-            direction = np.array([0.0, 0.0, 1.0])
+            return LinearTrajectory(start_xyz, impact_xyz, exec_time), impact_xyz
         else:
             direction = direction / norm
 
@@ -623,6 +654,8 @@ class StrikePlanner(Node):
             max(0.0, self.max_follow_through_distance),
         )
         follow_xyz = impact_xyz + direction * follow_distance
+        if self.lock_contact_height:
+            follow_xyz[2] = impact_xyz[2]
         follow_duration = max(0.0, self.follow_through_duration)
         follow_time = exec_time + follow_duration
         if follow_time <= exec_time + 1e-6:
