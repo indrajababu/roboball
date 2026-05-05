@@ -122,6 +122,7 @@ class TrajectoryPredictor(Node):
 
         stationary, raw_speed, raw_spread = self._stationary_start_status()
         if stationary:
+            print("stationary!")
             self._last_stationary_start_pub_time = self._now_sec()
             self._stationary_start_armed = False
             self._publish_target(

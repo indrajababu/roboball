@@ -60,8 +60,11 @@ CONTROL_PERIOD_S = 0.1
 BASE_FRAME = 'base_link'
 EE_FRAME = 'tool0'
 IK_LINK_NAME = 'tool0'
+GRAVITY = 9.81
 INCH_TO_M = 0.0254
 DEFAULT_PADDLE_OFFSET_TOOL0 = [0.0, 0.0, 7.0 * INCH_TO_M]
+MAX_POP_FOLLOW_THROUGH_M = 6.0 * INCH_TO_M
+DEFAULT_POP_TRIGGER_CLEARANCE_M = 10.0 * INCH_TO_M
 
 
 class PiecewiseLinearTrajectory:
@@ -108,6 +111,32 @@ class StrikePlanner(Node):
         self.max_xy_step = float(self.declare_parameter('max_xy_step', 0.12).value)
         self.max_z_drop = float(self.declare_parameter('max_z_drop', 0.02).value)
         self.max_z_rise = float(self.declare_parameter('max_z_rise', 0.06).value)
+        self.lock_contact_height = bool(
+            self.declare_parameter('lock_contact_height', True).value
+        )
+        configured_contact_height = float(
+            self.declare_parameter('contact_height', float('nan')).value
+        )
+        self.contact_height = (
+            configured_contact_height
+            if np.isfinite(configured_contact_height)
+            else None
+        )
+        self.min_body_clearance_radius = float(
+            self.declare_parameter('min_body_clearance_radius', 0.30).value
+        )
+        self.retime_pop_for_ball_clearance = bool(
+            self.declare_parameter('retime_pop_for_ball_clearance', True).value
+        )
+        self.pop_trigger_clearance = float(
+            self.declare_parameter(
+                'pop_trigger_clearance',
+                DEFAULT_POP_TRIGGER_CLEARANCE_M,
+            ).value
+        )
+        self.predictor_strike_height = float(
+            self.declare_parameter('predictor_strike_height', 0.60).value
+        )
         self.min_exec_time = float(self.declare_parameter('min_exec_time', 0.12).value)
         self.drop_late_targets = bool(self.declare_parameter('drop_late_targets', False).value)
         self.late_target_exec_time = float(
@@ -115,14 +144,30 @@ class StrikePlanner(Node):
         )
         self.swing_through = bool(self.declare_parameter('swing_through', True).value)
         self.follow_through_distance = float(
-            self.declare_parameter('follow_through_distance', 0.22).value
+            self.declare_parameter('follow_through_distance', 0.44).value
         )
+        self.max_follow_through_distance = float(
+            self.declare_parameter(
+                'max_follow_through_distance',
+                MAX_POP_FOLLOW_THROUGH_M,
+            ).value
+        )
+        if self.follow_through_distance > self.max_follow_through_distance:
+            self.get_logger().warn(
+                f'Clamping follow_through_distance from '
+                f'{self.follow_through_distance:.3f}m to '
+                f'{self.max_follow_through_distance:.3f}m.'
+            )
+            self.follow_through_distance = self.max_follow_through_distance
         self.follow_through_duration = float(
             self.declare_parameter('follow_through_duration', 0.045).value
         )
         self.follow_through_direction = np.array(
             self.declare_parameter('follow_through_direction', [0.0, 0.0, 1.0]).value,
             dtype=np.float64,
+        )
+        self.vertical_pop_only = bool(
+            self.declare_parameter('vertical_pop_only', True).value
         )
         self.recover_after_follow_through = bool(
             self.declare_parameter('recover_after_follow_through', True).value
@@ -144,6 +189,9 @@ class StrikePlanner(Node):
         )
         self.one_swing_per_target_burst = bool(
             self.declare_parameter('one_swing_per_target_burst', True).value
+        )
+        self.allow_retarget_while_busy = bool(
+            self.declare_parameter('allow_retarget_while_busy', False).value
         )
         self.rearm_quiet_time = float(self.declare_parameter('rearm_quiet_time', 0.75).value)
         self.settle_position_tolerance = float(
@@ -239,6 +287,7 @@ class StrikePlanner(Node):
         self._busy = False
         self._planning = False
         self._pending_target = None
+        self._nominal_paddle_z = self.contact_height
         self._strike_armed = True
         self._last_target_rx_time = None
         self._lock = threading.Lock()
@@ -255,11 +304,19 @@ class StrikePlanner(Node):
             f'num_waypoints={self.num_waypoints}, ik_budget={self.ik_budget:.2f}s, '
             f'ik_timeout={self.ik_timeout:.2f}s. '
             f'limit_target_step={self.limit_target_step}. '
+            f'lock_contact_height={self.lock_contact_height}, '
+            f'contact_height={self.contact_height}. '
+            f'min_body_clearance_radius={self.min_body_clearance_radius:.3f}m. '
+            f'retime_pop_for_ball_clearance={self.retime_pop_for_ball_clearance}, '
+            f'pop_trigger_clearance={self.pop_trigger_clearance:.3f}m, '
+            f'predictor_strike_height={self.predictor_strike_height:.3f}m. '
             f'drop_late_targets={self.drop_late_targets}, '
             f'late_target_exec_time={self.late_target_exec_time:.2f}s. '
             f'swing_through={self.swing_through}, '
             f'follow_through_distance={self.follow_through_distance:.3f}m, '
+            f'max_follow_through_distance={self.max_follow_through_distance:.3f}m, '
             f'follow_through_duration={self.follow_through_duration:.2f}s. '
+            f'vertical_pop_only={self.vertical_pop_only}. '
             f'recover_after_follow_through={self.recover_after_follow_through}, '
             f'match_recovery_to_follow_through={self.match_recovery_to_follow_through}, '
             f'recovery_distance={self.recovery_distance:.3f}m, '
@@ -267,6 +324,7 @@ class StrikePlanner(Node):
             f'sharp_piecewise_velocities={self.sharp_piecewise_velocities}. '
             f'max_z_rise={self.max_z_rise:.3f}m. '
             f'one_swing_per_target_burst={self.one_swing_per_target_burst}, '
+            f'allow_retarget_while_busy={self.allow_retarget_while_busy}, '
             f'rearm_quiet_time={self.rearm_quiet_time:.2f}s. '
             f'orient_paddle_to_ball_velocity={self.orient_paddle_to_ball_velocity}, '
             f'fallback_to_current_orientation={self.fallback_to_current_orientation}, '
@@ -289,8 +347,12 @@ class StrikePlanner(Node):
             now_mono = time.monotonic()
             with self._lock:
                 self._last_target_rx_time = now_mono
-                active_retarget = self._busy
-                if self.one_swing_per_target_burst and not self._strike_armed and not active_retarget:
+                if self._busy and not self.allow_retarget_while_busy:
+                    self.get_logger().debug(
+                        'Strike busy; ignoring target until pop/recovery completes.'
+                    )
+                    return
+                if self.one_swing_per_target_burst and not self._strike_armed:
                     self.get_logger().debug('Strike disarmed until target stream goes quiet.')
                     return
                 if self._planning:
@@ -335,6 +397,12 @@ class StrikePlanner(Node):
             tf.transform.rotation.w,
         )
         start_xyz = _tool_to_paddle_xyz(tool_xyz, tool_quat, self.paddle_offset_tool0)
+        if self._nominal_paddle_z is None:
+            self._nominal_paddle_z = float(start_xyz[2])
+            self.get_logger().info(
+                f'Locked nominal paddle height at {self._nominal_paddle_z:.3f}m.'
+            )
+
         impact_xyz = np.array([
             msg.impact_pose.position.x,
             msg.impact_pose.position.y,
@@ -346,6 +414,27 @@ class StrikePlanner(Node):
                 now_sec=self.get_clock().now().nanoseconds * 1e-9,
             )
 
+        ball_velocity = np.array([
+            msg.ball_velocity_at_impact.x,
+            msg.ball_velocity_at_impact.y,
+            msg.ball_velocity_at_impact.z,
+        ], dtype=np.float64)
+        predicted_tti = msg.time_to_impact.sec + msg.time_to_impact.nanosec * 1e-9
+
+        impact_xyz, ball_velocity, predicted_tti = self._retime_for_pop_clearance(
+            impact_xyz,
+            ball_velocity,
+            predicted_tti,
+        )
+
+        if self.lock_contact_height:
+            impact_xyz[2] = self._nominal_paddle_z
+
+        impact_xyz[:2] = _clamp_xy_away_from_body(
+            impact_xyz[:2],
+            self.min_body_clearance_radius,
+        )
+
         if self.limit_target_step:
             # Optional safety/testing mode: keep each strike inside a small
             # neighborhood around the current paddle point.
@@ -354,18 +443,23 @@ class StrikePlanner(Node):
             if xy_norm > self.max_xy_step and xy_norm > 1e-9:
                 impact_xyz[:2] = start_xyz[:2] + (xy_delta / xy_norm) * self.max_xy_step
 
-            min_allowed_z = start_xyz[2] - self.max_z_drop
-            if impact_xyz[2] < min_allowed_z:
-                impact_xyz[2] = min_allowed_z
-            max_allowed_z = start_xyz[2] + self.max_z_rise
-            if impact_xyz[2] > max_allowed_z:
-                impact_xyz[2] = max_allowed_z
+            impact_xyz[:2] = _clamp_xy_away_from_body(
+                impact_xyz[:2],
+                self.min_body_clearance_radius,
+            )
 
-        ball_velocity = np.array([
-            msg.ball_velocity_at_impact.x,
-            msg.ball_velocity_at_impact.y,
-            msg.ball_velocity_at_impact.z,
-        ], dtype=np.float64)
+            if not self.lock_contact_height:
+                min_allowed_z = start_xyz[2] - self.max_z_drop
+                if impact_xyz[2] < min_allowed_z:
+                    impact_xyz[2] = min_allowed_z
+                max_allowed_z = start_xyz[2] + self.max_z_rise
+                if impact_xyz[2] > max_allowed_z:
+                    impact_xyz[2] = max_allowed_z
+
+        trajectory_start_xyz = start_xyz.copy()
+        if self.lock_contact_height:
+            trajectory_start_xyz[2] = self._nominal_paddle_z
+
         if self.orient_paddle_to_ball_velocity:
             quat = _quat_with_tool_axis_aligned_to_vector(
                 self.paddle_normal_axis,
@@ -379,7 +473,6 @@ class StrikePlanner(Node):
             q = msg.impact_pose.orientation
             qx, qy, qz, qw = q.x, q.y, q.z, q.w
 
-        predicted_tti = msg.time_to_impact.sec + msg.time_to_impact.nanosec * 1e-9
         msg_stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         msg_age = max(0.0, now_sec - msg_stamp) if msg_stamp > 0.0 else 0.0
@@ -403,7 +496,7 @@ class StrikePlanner(Node):
 
         build_start = time.monotonic()
         cart_traj, final_paddle_xyz = self._make_cartesian_trajectory(
-            start_xyz,
+            trajectory_start_xyz,
             impact_xyz,
             exec_time,
         )
@@ -446,11 +539,65 @@ class StrikePlanner(Node):
         self.get_logger().info(
             f'Strike updated: {self.num_waypoints} waypoints over {exec_time:.2f}s '
             f'(age={msg_age:.3f}s, IK={build_elapsed:.3f}s) '
-            f'paddle from {start_xyz} through {impact_xyz} to {final_paddle_xyz}. '
+            f'paddle from {trajectory_start_xyz} through {impact_xyz} to {final_paddle_xyz}. '
             f'limits: max_xy_step={self.max_xy_step:.3f}, '
-            f'max_z_drop={self.max_z_drop:.3f}, max_z_rise={self.max_z_rise:.3f}'
+            f'max_z_drop={self.max_z_drop:.3f}, max_z_rise={self.max_z_rise:.3f}, '
+            f'locked_z={self._nominal_paddle_z}'
         )
         return True
+
+    def _retime_for_pop_clearance(self, impact_xyz, ball_velocity, predicted_tti):
+        if not self.retime_pop_for_ball_clearance:
+            return impact_xyz, ball_velocity, predicted_tti
+        if self._nominal_paddle_z is None:
+            return impact_xyz, ball_velocity, predicted_tti
+
+        desired_ball_z = self._nominal_paddle_z + self.pop_trigger_clearance
+        target_ball_z = self.predictor_strike_height
+
+        # The predictor gives time/velocity at its strike plane. Re-solve the
+        # same ballistic curve relative to that plane so the pop starts when
+        # the ball is one configured clearance above the locked paddle height.
+        a = -0.5 * GRAVITY
+        b = float(ball_velocity[2])
+        c = float(target_ball_z - desired_ball_z)
+        roots = np.roots(np.array([a, b, c], dtype=np.float64))
+
+        candidates = []
+        for root in roots:
+            if abs(root.imag) > 1e-7:
+                continue
+            tau = float(root.real)
+            time_from_msg = float(predicted_tti + tau)
+            if time_from_msg < 0.0:
+                continue
+            vz_at_pop = b - GRAVITY * tau
+            if vz_at_pop <= 0.0:
+                candidates.append((time_from_msg, tau, vz_at_pop))
+
+        if not candidates:
+            self.get_logger().warn(
+                f'Could not retime pop for ball clearance: '
+                f'target_ball_z={target_ball_z:.3f}m, '
+                f'desired_ball_z={desired_ball_z:.3f}m, '
+                f'vz={b:.3f}m/s. Using predictor timing.',
+                throttle_duration_sec=1.0,
+            )
+            return impact_xyz, ball_velocity, predicted_tti
+
+        new_tti, tau, vz_at_pop = min(candidates, key=lambda candidate: candidate[0])
+        retimed_impact_xyz = np.array(impact_xyz, dtype=np.float64).copy()
+        retimed_ball_velocity = np.array(ball_velocity, dtype=np.float64).copy()
+        retimed_impact_xyz[:2] += retimed_ball_velocity[:2] * tau
+        retimed_ball_velocity[2] = vz_at_pop
+
+        self.get_logger().info(
+            f'Pop retimed for ball clearance: clearance={self.pop_trigger_clearance:.3f}m, '
+            f'ball_z={desired_ball_z:.3f}m, '
+            f'tti {predicted_tti:.3f}s -> {new_tti:.3f}s.',
+            throttle_duration_sec=0.5,
+        )
+        return retimed_impact_xyz, retimed_ball_velocity, new_tti
 
     # ---------------------------------------------------------- trajectory build
 
@@ -459,6 +606,8 @@ class StrikePlanner(Node):
             return LinearTrajectory(start_xyz, impact_xyz, exec_time), impact_xyz
 
         direction = np.asarray(self.follow_through_direction, dtype=np.float64)
+        if self.vertical_pop_only:
+            direction = np.array([0.0, 0.0, 1.0], dtype=np.float64)
         norm = float(np.linalg.norm(direction))
         if norm < 1e-9:
             self.get_logger().warn(
@@ -469,7 +618,11 @@ class StrikePlanner(Node):
         else:
             direction = direction / norm
 
-        follow_xyz = impact_xyz + direction * self.follow_through_distance
+        follow_distance = min(
+            max(0.0, self.follow_through_distance),
+            max(0.0, self.max_follow_through_distance),
+        )
+        follow_xyz = impact_xyz + direction * follow_distance
         follow_duration = max(0.0, self.follow_through_duration)
         follow_time = exec_time + follow_duration
         if follow_time <= exec_time + 1e-6:
@@ -481,7 +634,12 @@ class StrikePlanner(Node):
 
         recovery_duration = max(0.0, self.recovery_duration)
         if self.recover_after_follow_through and recovery_duration > 1e-6:
-            recovery_xyz = follow_xyz - direction * self.recovery_distance
+            recovery_xyz = follow_xyz.copy()
+            recovery_xyz[2] = (
+                self._nominal_paddle_z
+                if self._nominal_paddle_z is not None
+                else start_xyz[2]
+            )
             recovery_time = follow_time + recovery_duration
             times.append(recovery_time)
             positions.append(recovery_xyz)
@@ -860,6 +1018,19 @@ def _paddle_to_tool_xyz(paddle_xyz, tool_quat, paddle_offset_tool0):
     return np.asarray(paddle_xyz, dtype=np.float64) - (
         _quat_to_rot(*tool_quat) @ np.asarray(paddle_offset_tool0, dtype=np.float64)
     )
+
+
+def _clamp_xy_away_from_body(xy, min_radius):
+    min_radius = max(0.0, float(min_radius))
+    point = np.asarray(xy, dtype=np.float64).copy()
+    if min_radius <= 0.0:
+        return point
+    radius = float(np.linalg.norm(point))
+    if radius >= min_radius:
+        return point
+    if radius < 1e-9:
+        return np.array([min_radius, 0.0], dtype=np.float64)
+    return point * (min_radius / radius)
 
 
 def _quat_with_tool_axis_aligned_to_vector(axis_name, target_vector, fallback_quat):

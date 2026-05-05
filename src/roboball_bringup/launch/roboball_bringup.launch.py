@@ -8,7 +8,7 @@ Launches, in order:
   - Trajectory validator (safety layer in front of the UR trajectory controller)
   - Ball detector (publishes /ball_pose), default detector: HSV
   - Trajectory predictor (publishes /strike_target)
-  - Strike planner (gated off by default — see start_strike_planner)
+  - Horizontal pop tracker (gated off by default — see start_strike_planner)
 
 Seeded from lab5/planning/launch/lab5_bringup.launch.py.
 
@@ -19,7 +19,7 @@ Optional args:
   ur_type:=ur7e                      — robot type forwarded to ur_moveit_config
   detector:=hsv|yolo                 — ball_detector backend (default hsv)
   strike_height:=<meters>            — strike-plane Z in base_link (default 0.60)
-  start_strike_planner:=true|false   — auto-start the strike planner (default false).
+  start_strike_planner:=true|false   — auto-start arm tracking/pop control (default false).
                                        Off so go_home keeps using
                                        scaled_joint_trajectory_controller; start
                                        the planner manually once parked.
@@ -151,46 +151,32 @@ def generate_launch_description():
         }],
     )
 
-    strike_planner_node = Node(
+    horizontal_pop_tracker_node = Node(
         package='roboball_planning',
-        executable='strike_planner',
-        name='strike_planner',
+        executable='horizontal_pop_tracker',
+        name='horizontal_pop_tracker',
         output='screen',
         parameters=[{
-            'num_waypoints': 5,
-            'limit_target_step': True,
-            'max_z_rise': 0.06,
-            'drop_late_targets': False,
-            'late_target_exec_time': 0.5,
-            'swing_through': True,
-            'follow_through_distance': 0.22,
-            'follow_through_duration': 0.045,
-            'follow_through_direction': [0.0, 0.0, 1.0],
-            'recover_after_follow_through': True,
-            'match_recovery_to_follow_through': True,
-            'recovery_distance': 0.22,
-            'recovery_duration': 0.045,
-            'sharp_piecewise_velocities': True,
-            'one_swing_per_target_burst': True,
-            'rearm_quiet_time': 0.75,
-            'settle_position_tolerance': 0.025,
-            'settle_velocity_tolerance': 0.05,
-            'settle_timeout': 0.0,
-            'ik_budget': 0.08,
-            'ik_timeout': 0.15,
+            'lock_contact_height': True,
+            'control_period': 0.05,
+            'min_body_clearance_radius': 0.30,
+            'pop_trigger_clearance': 0.254,
+            'pop_height': 0.1524,
+            'pop_hold_duration': 0.10,
+            'recovery_duration': 0.05,
+            'pop_rearm_hysteresis': 0.08,
+            'min_pop_interval': 0.45,
+            'descending_velocity_threshold': -0.05,
+            'ball_timeout': 0.35,
+            'ik_timeout': 0.06,
             'ee_frame': 'tool0',
             'ik_link_name': 'tool0',
-            'orient_paddle_to_ball_velocity': False,
-            'fallback_to_current_orientation': True,
-            # The paddle face lies in tool0's ZX plane, so its normal is +/-Y.
-            # Use -Y so the striking face points opposite incoming ball motion.
-            'paddle_normal_axis': '-y',
             # 7 inches from the tool0 origin to the paddle contact point.
             # Adjust axis/sign if the physical paddle points along a different
             # tool0-frame direction.
             'paddle_offset_tool0': [0.0, 0.0, 0.1778],
-            'publish_debug_markers': True,
-            'debug_marker_frame': 'base_link',
+            'ball_to_paddle_offset': [-0.082, 0.094, 0.116],
+            'ball_to_paddle_offset_margin': [0.0, 0.0, 0.0],
         }],
         condition=IfCondition(start_strike_planner),
     )
@@ -215,6 +201,6 @@ def generate_launch_description():
         validator_node,
         ball_detector_node,
         predictor_node,
-        strike_planner_node,
+        horizontal_pop_tracker_node,
         # shutdown_on_any_exit,  # disabled during debugging — re-enable for demo
     ])

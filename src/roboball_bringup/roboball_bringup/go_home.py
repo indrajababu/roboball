@@ -77,7 +77,7 @@ class GoHome(Node):
         point.positions = list(HOME_POSITIONS)
         point.velocities = [0.0] * len(HOME_POSITIONS)
         point.accelerations = [0.0] * len(HOME_POSITIONS)
-        point.time_from_start.sec = 2
+        point.time_from_start.sec = 1
         point.time_from_start.nanosec = 0
 
         traj.points.append(point)
