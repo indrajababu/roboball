@@ -1,38 +1,20 @@
 """
-Ball detector — supports two interchangeable backends:
+Ball detector.
 
-  * detector=yolo (default): run YOLOv8 on the cached RealSense color image,
-    project cloud points into the image plane, keep points inside any
-    sports-ball bbox. Pretrained weights auto-download to
-    ~/.config/Ultralytics on first run. One-time setup inside the distrobox:
-        pip install -r src/roboball_perception/requirements.txt
+Filters a colored point cloud by HSV (using the packed `rgb` field), then
+applies a simple workspace box and publishes the centroid.
 
-  * detector=hsv: per-point HSV color mask on the depth+color point cloud's
-    `rgb` field, AND'd with the workspace bounding box. No external weights.
-    Tune the bounds with `--tune` (see below).
+Publishes:
+  /ball_pose        geometry_msgs/PointStamped
+  /filtered_points  sensor_msgs/PointCloud2
 
-Switch live without rebuilding:
-    ros2 param set /ball_detector detector hsv
-    ros2 param set /ball_detector detector yolo
-
-Both backends publish:
-    /ball_pose        geometry_msgs/PointStamped — centroid in target_frame
-    /filtered_points  sensor_msgs/PointCloud2    — surviving points
-
-Tune HSV bounds:
-  Live, against the lab RealSense (run inside the distrobox while the camera
-  is publishing):
-    ros2 run roboball_perception ball_detector --tune \\
-        --topic /camera/camera/color/image_raw
-  Offline, on a laptop (no ROS):
-    python3 ball_detector.py --tune --camera 0
-    python3 ball_detector.py --tune --image ball.jpg
-  On a running detector node, push values directly:
-    ros2 param set /ball_detector hsv_lower1 '[h, s, v]'
+HSV tuning helpers:
+  ros2 run roboball_perception ball_detector --tune --topic /camera/camera/color/image_raw
+  python3 ball_detector.py --tune --camera 0
+  python3 ball_detector.py --tune --image ball.jpg
 """
 
 import sys
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -48,7 +30,7 @@ try:
     from rclpy.qos import qos_profile_sensor_data
     from rclpy.time import Time
     from rcl_interfaces.msg import SetParametersResult
-    from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+    from sensor_msgs.msg import Image, PointCloud2
     from geometry_msgs.msg import PointStamped
     from std_msgs.msg import Header
     from cv_bridge import CvBridge
@@ -61,33 +43,13 @@ except ImportError:
     Node = object  # so the class definition below still parses
 
 
-SPORTS_BALL_CLASS_ID = 32  # COCO
-
-
 class BallDetector(Node):
     def __init__(self):
         super().__init__('ball_detector')
 
-        # ---- backend selection -----------------------------------------
-        self.detector_mode = str(
-            self.declare_parameter('detector', 'yolo').value
-        ).lower()
-        if self.detector_mode not in ('yolo', 'hsv'):
-            self.get_logger().warn(
-                f"Unknown detector '{self.detector_mode}', falling back to 'yolo'."
-            )
-            self.detector_mode = 'yolo'
-
-        # ---- frames + workspace box (shared by both backends) ----------
+        # frames + workspace box
         self.target_frame = self.declare_parameter('target_frame', 'base_link').value
-        self.color_frame = self.declare_parameter(
-            'color_frame', 'camera_color_optical_frame'
-        ).value
-        # HSV path uses depth-optical as the cloud's frame (matches the
-        # /depth/color/points output); kept configurable for sim variants.
-        self.source_frame = self.declare_parameter(
-            'source_frame', 'camera_depth_optical_frame'
-        ).value
+        self.source_frame = self.declare_parameter('source_frame', 'camera_depth_optical_frame').value
 
         self.min_x = float(self.declare_parameter('min_x', -0.80).value)
         self.max_x = float(self.declare_parameter('max_x',  0.80).value)
@@ -97,25 +59,7 @@ class BallDetector(Node):
         self.max_z = float(self.declare_parameter('max_z',  2.00).value)
         self.cloud_stride = max(1, int(self.declare_parameter('cloud_stride', 2).value))
 
-        # ---- YOLO params ------------------------------------------------
-        self.yolo_weights = str(self.declare_parameter('yolo_weights', 'yolov8n.pt').value)
-        self.conf_thresh = float(self.declare_parameter('yolo_conf', 0.25).value)
-        self.class_id = int(
-            self.declare_parameter('yolo_class', SPORTS_BALL_CLASS_ID).value
-        )
-        self.min_inliers = int(self.declare_parameter('min_inliers', 20).value)
-        self.log_missed_classes = bool(
-            self.declare_parameter('yolo_log_missed_classes', True).value
-        )
-        self.yolo_infer_hz = float(self.declare_parameter('yolo_infer_hz', 8.0).value)
-        self.yolo_imgsz = int(self.declare_parameter('yolo_imgsz', 640).value)
-
-        # ---- HSV params -------------------------------------------------
-        # Defaults carried over from commit 8ea3c1e — tuned for the lab beach
-        # ball under lab lighting (red/orange wedge: H≈0-12, high S, V>=80).
-        # Re-tune with --tune if the ball or lighting changes. Set hsv_upper2
-        # to all-zeros to disable the second range (used for red wraparound
-        # when lower1 already starts at H=0).
+        # hsv params
         self.hsv_lower1 = list(self.declare_parameter('hsv_lower1', [0, 120, 80]).value)
         self.hsv_upper1 = list(self.declare_parameter('hsv_upper1', [12, 255, 255]).value)
         self.hsv_lower2 = list(self.declare_parameter('hsv_lower2', [0, 0, 0]).value)
@@ -124,220 +68,24 @@ class BallDetector(Node):
 
         self.add_on_set_parameters_callback(self._on_parameter_update)
 
-        # ---- backend-specific init -------------------------------------
-        self.bridge = CvBridge()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self.latest_bgr: Optional[np.ndarray] = None
-        self.color_K: Optional[np.ndarray] = None
-        self.image_w = 0
-        self.image_h = 0
-        self._cached_target_dets = []
-        self._cached_all_dets = []
-        self._last_infer_time = -1e9
-        self.model = None
-        if self.detector_mode == 'yolo':
-            self._load_yolo(self.yolo_weights)
-
-        # Subscriptions are shared. Image + camera_info are only consumed by
-        # the YOLO path, but keeping them subscribed lets the user toggle
-        # backends at runtime via `ros2 param set`.
-        self.create_subscription(
-            Image, '/camera/camera/color/image_raw',
-            self._on_image, qos_profile_sensor_data,
-        )
-        self.create_subscription(
-            CameraInfo, '/camera/camera/color/camera_info',
-            self._on_camera_info, 10,
-        )
         self.create_subscription(
             PointCloud2, '/camera/camera/depth/color/points',
-            self._on_pointcloud, 10,
+            self._on_cloud, 10,
         )
 
         self.ball_pose_pub = self.create_publisher(PointStamped, '/ball_pose', 1)
         self.filtered_points_pub = self.create_publisher(PointCloud2, '/filtered_points', 1)
 
         self.get_logger().info(
-            f"Ball detector up. backend={self.detector_mode}, "
-            f"target={self.target_frame}, "
-            f"workspace x=[{self.min_x},{self.max_x}] y=[{self.min_y},{self.max_y}] "
-            f"z=[{self.min_z},{self.max_z}], cloud_stride={self.cloud_stride}."
+            f"ball_detector up: target={self.target_frame} "
+            f"x=[{self.min_x},{self.max_x}] y=[{self.min_y},{self.max_y}] "
+            f"z=[{self.min_z},{self.max_z}] stride={self.cloud_stride}"
         )
 
-    # ----------------------------------------------------------- yolo init
-
-    def _load_yolo(self, weights: str):
-        try:
-            from ultralytics import YOLO
-        except ImportError as ex:
-            self.get_logger().error(
-                f"Cannot load YOLO ({ex}). Either install ultralytics "
-                "(`pip install -r src/roboball_perception/requirements.txt`) "
-                "or run with `detector:=hsv`."
-            )
-            raise
-        self.get_logger().info(f"Loading YOLO weights: {weights}")
-        self.model = YOLO(weights)
-
-    # --------------------------------------------------------- subscriptions
-
-    def _on_camera_info(self, msg: 'CameraInfo'):
-        if self.color_K is None:
-            self.color_K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
-            self.image_w = int(msg.width)
-            self.image_h = int(msg.height)
-            self.get_logger().info(
-                f"Color intrinsics ready: {self.image_w}x{self.image_h}, "
-                f"fx={self.color_K[0,0]:.1f} fy={self.color_K[1,1]:.1f}"
-            )
-
-    def _on_image(self, msg: 'Image'):
-        try:
-            self.latest_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as ex:
-            self.get_logger().warn(f"cv_bridge failed: {ex}", throttle_duration_sec=5.0)
-
-    def _on_pointcloud(self, msg: 'PointCloud2'):
-        if self.detector_mode == 'yolo':
-            self._handle_yolo(msg)
-        else:
-            self._handle_hsv(msg)
-
-    # ================================================================ YOLO
-
-    def _handle_yolo(self, msg: 'PointCloud2'):
-        if self.latest_bgr is None:
-            self.get_logger().warn('No color image yet.', throttle_duration_sec=2.0)
-            return
-        if self.color_K is None:
-            self.get_logger().warn('No camera_info yet.', throttle_duration_sec=2.0)
-            return
-        if self.model is None:
-            # User toggled to yolo but weights never loaded.
-            try:
-                self._load_yolo(self.yolo_weights)
-            except ImportError:
-                return
-
-        stamp_sec = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
-        infer_period = 1.0 / max(self.yolo_infer_hz, 0.1)
-        run_infer = (stamp_sec - self._last_infer_time) >= infer_period
-
-        if run_infer or not self._cached_all_dets:
-            bboxes, all_dets = self._detect_bboxes(self.latest_bgr)
-            self._cached_target_dets = bboxes
-            self._cached_all_dets = all_dets
-            self._last_infer_time = stamp_sec
-        else:
-            bboxes = self._cached_target_dets
-            all_dets = self._cached_all_dets
-
-        if not bboxes:
-            if self.log_missed_classes and all_dets:
-                top = sorted(all_dets, key=lambda d: d['conf'], reverse=True)[:3]
-                summary = ', '.join(
-                    f"{d['name']}({d['class_id']}):{d['conf']:.2f}" for d in top
-                )
-                self.get_logger().warn(
-                    f'YOLO saw other classes, not target class-{self.class_id}: {summary}',
-                    throttle_duration_sec=2.0,
-                )
-            self.get_logger().warn(
-                f"YOLO: no class-{self.class_id} detections.",
-                throttle_duration_sec=2.0,
-            )
-            return
-
-        try:
-            tf_color = self.tf_buffer.lookup_transform(
-                self.color_frame, msg.header.frame_id, Time())
-            tf_base = self.tf_buffer.lookup_transform(
-                self.target_frame, msg.header.frame_id, Time())
-        except TransformException as ex:
-            self.get_logger().warn(f"TF lookup failed: {ex}", throttle_duration_sec=2.0)
-            return
-
-        try:
-            raw = pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
-        except Exception as ex:
-            self.get_logger().warn(f"cloud read failed: {ex}", throttle_duration_sec=5.0)
-            return
-        pts_src = np.column_stack((raw['x'], raw['y'], raw['z'])).astype(np.float64)
-        if pts_src.size == 0:
-            return
-        if self.cloud_stride > 1:
-            pts_src = pts_src[::self.cloud_stride]
-
-        pts_color = _apply_transform(tf_color, pts_src)
-        pts_base = _apply_transform(tf_base, pts_src)
-
-        z = pts_color[:, 2]
-        in_front = z > 0.0
-        u = self.color_K[0, 0] * pts_color[:, 0] / np.where(in_front, z, 1.0) + self.color_K[0, 2]
-        v = self.color_K[1, 1] * pts_color[:, 1] / np.where(in_front, z, 1.0) + self.color_K[1, 2]
-        in_image = in_front & (u >= 0) & (u < self.image_w) & (v >= 0) & (v < self.image_h)
-
-        bbox_mask = np.zeros(len(pts_src), dtype=bool)
-        for bbox, _ in bboxes:
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            bbox_mask |= in_image & (u >= x1) & (u <= x2) & (v >= y1) & (v <= y2)
-
-        ws_mask = (
-            (pts_base[:, 0] >= self.min_x) & (pts_base[:, 0] <= self.max_x)
-            & (pts_base[:, 1] >= self.min_y) & (pts_base[:, 1] <= self.max_y)
-            & (pts_base[:, 2] >= self.min_z) & (pts_base[:, 2] <= self.max_z)
-        )
-        mask = bbox_mask & ws_mask
-
-        n_inliers = int(mask.sum())
-        if n_inliers < self.min_inliers:
-            self.get_logger().warn(
-                f"Only {n_inliers} inliers (< {self.min_inliers}) — skipping.",
-                throttle_duration_sec=2.0,
-            )
-            return
-
-        filtered = pts_base[mask].astype(np.float32)
-        self._publish(filtered, msg.header.stamp)
-
-    def _detect_bboxes(self, bgr: np.ndarray):
-        classes_filter = None if self.class_id < 0 else [self.class_id]
-        results = self.model.predict(
-            bgr,
-            conf=self.conf_thresh,
-            classes=classes_filter,
-            imgsz=self.yolo_imgsz,
-            verbose=False,
-        )
-        bboxes = []
-        all_dets = []
-        names = self.model.names if hasattr(self.model, 'names') else {}
-        for r in results:
-            if r.boxes is None or r.boxes.xyxy is None:
-                continue
-            xyxy = r.boxes.xyxy.cpu().numpy()
-            confs = r.boxes.conf.cpu().numpy() if r.boxes.conf is not None else None
-            classes = r.boxes.cls.cpu().numpy().astype(int) if r.boxes.cls is not None else None
-            for i, b in enumerate(xyxy):
-                conf = float(confs[i]) if confs is not None else None
-                class_id = int(classes[i]) if classes is not None else -1
-                class_name = str(names.get(class_id, class_id)) if isinstance(names, dict) else str(class_id)
-                det = {
-                    'bbox': b.astype(int),
-                    'conf': 0.0 if conf is None else conf,
-                    'class_id': class_id,
-                    'name': class_name,
-                }
-                all_dets.append(det)
-                if self.class_id < 0 or class_id == self.class_id:
-                    bboxes.append((det['bbox'], det['conf']))
-        return bboxes, all_dets
-
-    # ================================================================= HSV
-
-    def _handle_hsv(self, msg: 'PointCloud2'):
+    def _on_cloud(self, msg: 'PointCloud2'):
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.target_frame, msg.header.frame_id, Time())
@@ -348,8 +96,6 @@ class BallDetector(Node):
             )
             return
 
-        # Color-filter before transforming; on a sparse ball mask this avoids
-        # spending transform time on most of the scene.
         try:
             raw = pc2.read_points(msg, field_names=('x', 'y', 'z', 'rgb'), skip_nans=True)
         except (ValueError, AssertionError) as ex:
@@ -367,7 +113,7 @@ class BallDetector(Node):
         color_mask = hsv_mask_from_packed_rgb(raw['rgb'], self._hsv_ranges())
         if not np.any(color_mask):
             self.get_logger().warn(
-                'No points survived HSV filter — check HSV params.',
+                'no points survived HSV filter',
                 throttle_duration_sec=2.0,
             )
             return
@@ -382,23 +128,21 @@ class BallDetector(Node):
             & (points[:, 1] >= self.min_y) & (points[:, 1] <= self.max_y)
             & (points[:, 2] >= self.min_z) & (points[:, 2] <= self.max_z)
         )
-        mask = ws_mask
-
-        n = int(mask.sum())
-        if n == 0:
+        n = int(ws_mask.sum())
+        if n <= 0:
             self.get_logger().warn(
-                'No HSV-matching points survived workspace filter — check TF and box params.',
+                'points matched HSV but not workspace box',
                 throttle_duration_sec=2.0,
             )
             return
         if n < self.min_color_points:
             self.get_logger().warn(
-                f"Only {n} color-matching points (< {self.min_color_points}) — skipping.",
+                f"only {n} points (< {self.min_color_points})",
                 throttle_duration_sec=2.0,
             )
             return
 
-        filtered = points[mask]
+        filtered = points[ws_mask]
         self._publish(filtered, msg.header.stamp)
 
     def _hsv_ranges(self):
@@ -407,8 +151,6 @@ class BallDetector(Node):
             ranges.append(HSVRange(self.hsv_lower2, self.hsv_upper2))
         return ranges
 
-    # ============================================================ shared
-
     def _publish(self, filtered: np.ndarray, stamp):
         header = Header(frame_id=self.target_frame, stamp=stamp)
         self.filtered_points_pub.publish(
@@ -416,15 +158,12 @@ class BallDetector(Node):
         )
         centroid = np.mean(filtered, axis=0)
         ball_pose = PointStamped()
-        # Use the cloud's stamp so the predictor sees the actual sensor time.
         ball_pose.header.stamp = stamp
         ball_pose.header.frame_id = self.target_frame
         ball_pose.point.x = float(centroid[0])
         ball_pose.point.y = float(centroid[1])
         ball_pose.point.z = float(centroid[2])
         self.ball_pose_pub.publish(ball_pose)
-
-    # ------------------------------------------------------------ params
 
     def _on_parameter_update(self, params):
         bounds = {
@@ -436,14 +175,7 @@ class BallDetector(Node):
             'hsv_lower1': self.hsv_lower1, 'hsv_upper1': self.hsv_upper1,
             'hsv_lower2': self.hsv_lower2, 'hsv_upper2': self.hsv_upper2,
         }
-        new_conf = self.conf_thresh
-        new_class = self.class_id
-        new_min_inliers = self.min_inliers
-        new_yolo_infer_hz = self.yolo_infer_hz
-        new_yolo_imgsz = self.yolo_imgsz
-        new_yolo_weights = self.yolo_weights
         new_min_color_points = self.min_color_points
-        new_detector = self.detector_mode
         new_cloud_stride = self.cloud_stride
 
         for p in params:
@@ -457,27 +189,6 @@ class BallDetector(Node):
                         reason=f"{p.name} must be 3 elements in [0, 255]",
                     )
                 hsv_arrays[p.name] = vals
-            elif p.name == 'yolo_conf' and p.type_ == Parameter.Type.DOUBLE:
-                if not 0.0 <= p.value <= 1.0:
-                    return SetParametersResult(
-                        successful=False, reason='yolo_conf must be in [0, 1]')
-                new_conf = float(p.value)
-            elif p.name == 'yolo_class' and p.type_ == Parameter.Type.INTEGER:
-                new_class = int(p.value)
-            elif p.name == 'min_inliers' and p.type_ == Parameter.Type.INTEGER:
-                new_min_inliers = int(p.value)
-            elif p.name == 'yolo_infer_hz' and p.type_ == Parameter.Type.DOUBLE:
-                if float(p.value) <= 0.0:
-                    return SetParametersResult(
-                        successful=False, reason='yolo_infer_hz must be > 0')
-                new_yolo_infer_hz = float(p.value)
-            elif p.name == 'yolo_imgsz' and p.type_ == Parameter.Type.INTEGER:
-                if int(p.value) <= 0:
-                    return SetParametersResult(
-                        successful=False, reason='yolo_imgsz must be > 0')
-                new_yolo_imgsz = int(p.value)
-            elif p.name == 'yolo_weights' and p.type_ == Parameter.Type.STRING:
-                new_yolo_weights = str(p.value)
             elif p.name == 'min_color_points' and p.type_ == Parameter.Type.INTEGER:
                 new_min_color_points = int(p.value)
             elif p.name == 'cloud_stride' and p.type_ == Parameter.Type.INTEGER:
@@ -485,12 +196,6 @@ class BallDetector(Node):
                     return SetParametersResult(
                         successful=False, reason='cloud_stride must be >= 1')
                 new_cloud_stride = int(p.value)
-            elif p.name == 'detector' and p.type_ == Parameter.Type.STRING:
-                v = str(p.value).lower()
-                if v not in ('yolo', 'hsv'):
-                    return SetParametersResult(
-                        successful=False, reason="detector must be 'yolo' or 'hsv'")
-                new_detector = v
 
         if (bounds['min_x'] > bounds['max_x']
                 or bounds['min_y'] > bounds['max_y']
@@ -504,31 +209,8 @@ class BallDetector(Node):
         self.hsv_upper1 = hsv_arrays['hsv_upper1']
         self.hsv_lower2 = hsv_arrays['hsv_lower2']
         self.hsv_upper2 = hsv_arrays['hsv_upper2']
-        self.conf_thresh = new_conf
-        self.class_id = new_class
-        self.min_inliers = new_min_inliers
-        self.yolo_infer_hz = new_yolo_infer_hz
-        self.yolo_imgsz = new_yolo_imgsz
-        self.yolo_weights = new_yolo_weights
         self.min_color_points = new_min_color_points
         self.cloud_stride = new_cloud_stride
-
-        if self.detector_mode == 'yolo' and self.model is None:
-            try:
-                self._load_yolo(self.yolo_weights)
-            except ImportError:
-                pass
-
-        if new_detector != self.detector_mode:
-            self.get_logger().info(
-                f"Detector backend switched: {self.detector_mode} -> {new_detector}"
-            )
-            self.detector_mode = new_detector
-            if new_detector == 'yolo' and self.model is None:
-                try:
-                    self._load_yolo(self.yolo_weights)
-                except ImportError:
-                    pass
         return SetParametersResult(successful=True)
 
 

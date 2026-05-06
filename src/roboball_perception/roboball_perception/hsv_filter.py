@@ -1,14 +1,8 @@
-"""Per-point HSV color filter for RealSense colored point clouds.
+"""Tiny HSV helper for filtering colored point clouds.
 
-Pure NumPy/OpenCV — no ROS imports. Used by `ball_detector.py` to gate
-points by color before centroid computation.
-
-The RealSense `/camera/camera/depth/color/points` topic publishes
-`sensor_msgs/PointCloud2` with an `rgb` field that is a 32-bit float whose
-underlying bytes are 0x00 RR GG BB. We unpack it without leaving NumPy.
+RealSense `PointCloud2` uses a packed float `rgb` field (PCL style):
+0x00 RR GG BB. We unpack that and run an HSV inRange.
 """
-
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Sequence
@@ -19,21 +13,15 @@ import numpy as np
 
 @dataclass
 class HSVRange:
-    """Inclusive HSV bounds. OpenCV convention: H in [0, 179], S/V in [0, 255]."""
     lower: Sequence[int]
     upper: Sequence[int]
 
     def as_arrays(self) -> tuple[np.ndarray, np.ndarray]:
-        return (np.array(self.lower, dtype=np.uint8),
-                np.array(self.upper, dtype=np.uint8))
+        return np.array(self.lower, dtype=np.uint8), np.array(self.upper, dtype=np.uint8)
 
 
 def unpack_rgb_float(rgb_packed: np.ndarray) -> np.ndarray:
-    """Decode the PointCloud2 packed-float `rgb` field into an Nx3 uint8 array.
-
-    Each scalar's raw 4 bytes are 0x00 RR GG BB (PCL convention). Output is
-    BGR-ordered to match OpenCV — i.e. column 0 is blue, 1 is green, 2 is red.
-    """
+    """Turn packed float rgb into Nx3 uint8 BGR (OpenCV order)."""
     rgb_packed = np.ascontiguousarray(rgb_packed, dtype=np.float32)
     raw = rgb_packed.view(np.uint32)
     b = (raw & 0xFF).astype(np.uint8)
@@ -43,11 +31,6 @@ def unpack_rgb_float(rgb_packed: np.ndarray) -> np.ndarray:
 
 
 def hsv_mask_from_bgr(bgr: np.ndarray, ranges: Sequence[HSVRange]) -> np.ndarray:
-    """Vectorized point-wise HSV mask. `bgr` is Nx3 uint8.
-
-    Returns a boolean array of length N: True where the point's color falls
-    within ANY of the supplied HSV ranges (OR'd, for red wraparound).
-    """
     if bgr.size == 0:
         return np.zeros(0, dtype=bool)
 
