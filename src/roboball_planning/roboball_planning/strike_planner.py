@@ -2,14 +2,11 @@
 Strike planner — Node 3 in the Roboball stack.
 
 For each `/strike_target`:
-  1. Look up current tool pose via TF (`base_link` -> `tool0`).
-  2. Convert between the paddle contact point and `tool0` using the configured
-     paddle offset.
-  3. Build a `LinearTrajectory` from current paddle point to impact point over
-     `time_to_impact`.
-  4. Pre-sample IK at NUM_WAYPOINTS evenly-spaced times; finite-difference for joint
+  1. Look up current paddle pose via TF (`base_link` -> `tool0`).
+  2. Build a `LinearTrajectory` from current pose to impact pose over `time_to_impact`.
+  3. Pre-sample IK at NUM_WAYPOINTS evenly-spaced times; finite-difference for joint
      velocities; pack into a JointTrajectory.
-  5. A 10 Hz timer interpolates that trajectory and drives the arm via
+  4. A 10 Hz timer interpolates that trajectory and drives the arm via
      `PIDJointVelocityController`, publishing to `/forward_velocity_controller/commands`.
 
 Activates `forward_velocity_controller` on startup and reverts to
@@ -34,8 +31,6 @@ from rclpy.time import Time
 from geometry_msgs.msg import Point, Pose, PoseArray
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from builtin_interfaces.msg import Duration
 from tf2_ros import Buffer, TransformListener, TransformException
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -43,7 +38,6 @@ from roboball_msgs.msg import StrikeTarget
 from roboball_planning.strike_objectives import ObjectiveConfig, StrikeObjectivePolicy
 from roboball_planning.ik import IKPlanner
 from roboball_planning.controller import PIDJointVelocityController
-from roboball_planning.trajectories import LinearTrajectory
 
 
 JOINT_ORDER = [
@@ -55,218 +49,50 @@ JOINT_ORDER = [
     'wrist_3_joint',
 ]
 
-NUM_WAYPOINTS = 2
-CONTROL_PERIOD_S = 0.1
+CONTROL_PERIOD_S = 0.03
 BASE_FRAME = 'base_link'
 EE_FRAME = 'tool0'
 IK_LINK_NAME = 'tool0'
-GRAVITY = 9.81
-INCH_TO_M = 0.0254
-DEFAULT_PADDLE_OFFSET_TOOL0 = [0.0, 0.0, 7.0 * INCH_TO_M]
-MAX_POP_FOLLOW_THROUGH_M = 0.0
-DEFAULT_POP_TRIGGER_CLEARANCE_M = 10.0 * INCH_TO_M
-
-
-class PiecewiseLinearTrajectory:
-    """Cartesian linear segments through required waypoints."""
-
-    def __init__(self, times, positions):
-        self.key_times = np.array(times, dtype=np.float64)
-        self.positions = np.array(positions, dtype=np.float64)
-        self.total_time = float(self.key_times[-1])
-        self.contact_time = float(self.key_times[1])
-
-    def target_pose(self, time):
-        t = float(np.clip(time, self.key_times[0], self.key_times[-1]))
-        idx = int(np.searchsorted(self.key_times, t, side='right') - 1)
-        idx = max(0, min(idx, len(self.key_times) - 2))
-        t0 = self.key_times[idx]
-        t1 = self.key_times[idx + 1]
-        alpha = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
-        pos = (1.0 - alpha) * self.positions[idx] + alpha * self.positions[idx + 1]
-        quat = np.array([0.0, 1.0, 0.0, 0.0])
-        return np.concatenate([pos, quat])
 
 
 class StrikePlanner(Node):
     def __init__(self):
         super().__init__('strike_planner')
         self._cb_group = ReentrantCallbackGroup()
-        objective_mode = str(self.declare_parameter('objective_mode', 'intercept').value)
-        self.apply_objective = bool(self.declare_parameter('apply_objective', False).value)
         self.use_current_tool_orientation = bool(
             self.declare_parameter('use_current_tool_orientation', True).value
         )
-        self.orient_paddle_to_ball_velocity = bool(
-            self.declare_parameter('orient_paddle_to_ball_velocity', False).value
+        paddle_offset = self.declare_parameter(
+            'paddle_contact_offset_xyz',
+            [-0.094, -0.057, 0.145],
+        ).value
+        self.paddle_contact_offset = np.array(
+            [float(paddle_offset[0]), float(paddle_offset[1]), float(paddle_offset[2])],
+            dtype=np.float64,
         )
-        self.fallback_to_current_orientation = bool(
-            self.declare_parameter('fallback_to_current_orientation', True).value
-        )
-        self.paddle_normal_axis = str(
-            self.declare_parameter('paddle_normal_axis', '-y').value
-        )
-        self.num_waypoints = int(self.declare_parameter('num_waypoints', 5).value)
-        self.limit_target_step = bool(self.declare_parameter('limit_target_step', True).value)
         self.max_xy_step = float(self.declare_parameter('max_xy_step', 0.12).value)
         self.max_z_drop = float(self.declare_parameter('max_z_drop', 0.02).value)
-        requested_max_z_rise = float(self.declare_parameter('max_z_rise', 0.0).value)
-        self.max_z_rise = 0.0
-        requested_lock_contact_height = bool(
-            self.declare_parameter('lock_contact_height', True).value
-        )
-        self.lock_contact_height = True
-        configured_contact_height = float(
-            self.declare_parameter('contact_height', float('nan')).value
-        )
-        self.contact_height = (
-            configured_contact_height
-            if np.isfinite(configured_contact_height)
-            else None
-        )
-        self.min_body_clearance_radius = float(
-            self.declare_parameter('min_body_clearance_radius', 0.30).value
-        )
-        self.retime_pop_for_ball_clearance = bool(
-            self.declare_parameter('retime_pop_for_ball_clearance', True).value
-        )
-        self.pop_trigger_clearance = float(
-            self.declare_parameter(
-                'pop_trigger_clearance',
-                DEFAULT_POP_TRIGGER_CLEARANCE_M,
-            ).value
-        )
-        self.predictor_strike_height = float(
-            self.declare_parameter('predictor_strike_height', 0.60).value
-        )
-        self.min_exec_time = float(self.declare_parameter('min_exec_time', 0.12).value)
-        self.drop_late_targets = bool(self.declare_parameter('drop_late_targets', False).value)
-        self.late_target_exec_time = float(
-            self.declare_parameter('late_target_exec_time', 0.5).value
-        )
-        requested_swing_through = bool(
-            self.declare_parameter('swing_through', False).value
-        )
-        self.swing_through = False
-        self.follow_through_distance = 0.0
-        self.max_follow_through_distance = float(
-            self.declare_parameter(
-                'max_follow_through_distance',
-                MAX_POP_FOLLOW_THROUGH_M,
-            ).value
-        )
-        if self.follow_through_distance > self.max_follow_through_distance:
-            self.get_logger().warn(
-                f'Clamping follow_through_distance from '
-                f'{self.follow_through_distance:.3f}m to '
-                f'{self.max_follow_through_distance:.3f}m.'
-            )
-            self.follow_through_distance = self.max_follow_through_distance
-        self.follow_through_duration = 0.0
-        self.follow_through_direction = np.array(
-            self.declare_parameter('follow_through_direction', [0.0, 0.0, 0.0]).value,
-            dtype=np.float64,
-        )
-        requested_vertical_pop_only = bool(
-            self.declare_parameter('vertical_pop_only', False).value
-        )
-        self.vertical_pop_only = False
-        if not requested_lock_contact_height:
-            self.get_logger().warn(
-                'lock_contact_height:=false requested, but vertical motion is '
-                'disabled; forcing locked contact height.'
-            )
-        if requested_max_z_rise > 0.0:
-            self.get_logger().warn(
-                'max_z_rise > 0 requested, but extra upward motion is disabled; '
-                'forcing max_z_rise=0.'
-            )
-        if requested_swing_through:
-            self.get_logger().warn(
-                'swing_through:=true requested, but extra upward follow-through '
-                'is disabled.'
-            )
-        if requested_vertical_pop_only:
-            self.get_logger().warn(
-                'vertical_pop_only:=true requested, but extra vertical pop '
-                'behavior is disabled in strike_planner.'
-            )
-        self.recover_after_follow_through = bool(
-            self.declare_parameter('recover_after_follow_through', True).value
-        )
-        self.match_recovery_to_follow_through = bool(
-            self.declare_parameter('match_recovery_to_follow_through', True).value
-        )
-        self.recovery_distance = 0.0
-        self.recovery_duration = float(
-            self.declare_parameter('recovery_duration', 0.045).value
-        )
-        if self.match_recovery_to_follow_through:
-            self.recovery_distance = self.follow_through_distance
-            self.recovery_duration = self.follow_through_duration
-        self.sharp_piecewise_velocities = bool(
-            self.declare_parameter('sharp_piecewise_velocities', True).value
-        )
-        self.one_swing_per_target_burst = bool(
-            self.declare_parameter('one_swing_per_target_burst', True).value
-        )
-        self.allow_retarget_while_busy = bool(
-            self.declare_parameter('allow_retarget_while_busy', False).value
-        )
-        self.rearm_quiet_time = float(self.declare_parameter('rearm_quiet_time', 0.75).value)
-        self.settle_position_tolerance = float(
-            self.declare_parameter('settle_position_tolerance', 0.025).value
-        )
-        self.settle_velocity_tolerance = float(
-            self.declare_parameter('settle_velocity_tolerance', 0.05).value
-        )
-        self.settle_timeout = float(self.declare_parameter('settle_timeout', 0.0).value)
-        self.ik_budget = float(self.declare_parameter('ik_budget', 0.08).value)
-        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.25).value)
-        self.ee_frame = str(self.declare_parameter('ee_frame', EE_FRAME).value)
-        self.ik_link_name = str(self.declare_parameter('ik_link_name', IK_LINK_NAME).value)
-        self.paddle_offset_tool0 = np.array(
-            self.declare_parameter(
-                'paddle_offset_tool0',
-                DEFAULT_PADDLE_OFFSET_TOOL0,
-            ).value,
-            dtype=np.float64,
-        )
+
+        self.min_exec_time = float(self.declare_parameter('min_exec_time', 0.04).value)
+
+        self.ik_budget = float(self.declare_parameter('ik_budget', 0.09).value)
+        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.06).value)
+
         self.publish_debug_markers = bool(
             self.declare_parameter('publish_debug_markers', True).value
         )
         self.debug_marker_frame = str(
             self.declare_parameter('debug_marker_frame', 'base_link').value
         )
-        blend_gain = float(self.declare_parameter('objective_blend_gain', 0.35).value)
-        center_xy = tuple(self.declare_parameter('objective_center_xy', [0.45, 0.0]).value)
-        zone_min_xy = tuple(self.declare_parameter('objective_zone_min_xy', [0.2, -0.3]).value)
-        zone_max_xy = tuple(self.declare_parameter('objective_zone_max_xy', [0.75, 0.3]).value)
-        human_xy = tuple(self.declare_parameter('objective_human_xy', [0.9, 0.0]).value)
-        circle_center_xy = tuple(
-            self.declare_parameter('objective_circle_center_xy', [0.45, 0.0]).value
-        )
-        circle_radius = float(self.declare_parameter('objective_circle_radius', 0.2).value)
-        circle_speed = float(self.declare_parameter('objective_circle_speed_rad_s', 0.7).value)
 
-        self.objective = StrikeObjectivePolicy(
-            ObjectiveConfig(
-                mode=objective_mode,
-                center_xy=(float(center_xy[0]), float(center_xy[1])),
-                zone_min_xy=(float(zone_min_xy[0]), float(zone_min_xy[1])),
-                zone_max_xy=(float(zone_max_xy[0]), float(zone_max_xy[1])),
-                human_xy=(float(human_xy[0]), float(human_xy[1])),
-                circle_center_xy=(float(circle_center_xy[0]), float(circle_center_xy[1])),
-                circle_radius=circle_radius,
-                circle_speed_rad_s=circle_speed,
-                blend_gain=blend_gain,
-            )
-        )
+        self.ik_link_name = IK_LINK_NAME
 
         # PID gains seeded from lab7/visual_servoing/main.py:58-60.
         Kp = 0.2 * np.array([0.4, 2.0, 1.7, 1.5, 2.0, 2.0])
         Kd = 0.01 * np.array([2.0, 1.0, 2.0, 0.5, 0.8, 0.8])
         Ki = 0.01 * np.array([1.4, 1.4, 1.4, 1.0, 0.6, 0.6])
+        self.Kq = 2 * np.array([0.4, 2.0, 1.7, 1.5, 2.0, 2.0])
+
         self.pid = PIDJointVelocityController(self, Kp, Ki, Kd)
 
         self.ik_planner = IKPlanner()
@@ -274,7 +100,14 @@ class StrikePlanner(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        self.simple_motion = True
+
+        self._busy = False
+        self._lock = threading.Lock()
+
         self.joint_state = None
+        self.strike_target = None
+
         self.create_subscription(
             JointState, '/joint_states', self._on_joint_state, 10,
             callback_group=self._cb_group,
@@ -301,56 +134,18 @@ class StrikePlanner(Node):
                 PoseArray, '/strike_planner/debug_waypoint_poses', debug_qos
             )
 
-        self._active_traj = None
-        self._active_start = None
-        self._interp_index = 0
-        self._busy = False
-        self._planning = False
-        self._pending_target = None
-        self._nominal_paddle_z = self.contact_height
-        self._strike_armed = True
-        self._last_target_rx_time = None
-        self._lock = threading.Lock()
-
         self._switch_controller(
             activate='forward_velocity_controller',
             deactivate='scaled_joint_trajectory_controller',
         )
 
+        self.cmd = None
+
         self.create_timer(CONTROL_PERIOD_S, self._control_tick, callback_group=self._cb_group)
 
         self.get_logger().info(
-            f'Strike planner up. objective_mode={self.objective.config.mode}. '
-            f'num_waypoints={self.num_waypoints}, ik_budget={self.ik_budget:.2f}s, '
             f'ik_timeout={self.ik_timeout:.2f}s. '
-            f'limit_target_step={self.limit_target_step}. '
-            f'lock_contact_height={self.lock_contact_height}, '
-            f'contact_height={self.contact_height}. '
-            f'min_body_clearance_radius={self.min_body_clearance_radius:.3f}m. '
-            f'retime_pop_for_ball_clearance={self.retime_pop_for_ball_clearance}, '
-            f'pop_trigger_clearance={self.pop_trigger_clearance:.3f}m, '
-            f'predictor_strike_height={self.predictor_strike_height:.3f}m. '
-            f'drop_late_targets={self.drop_late_targets}, '
-            f'late_target_exec_time={self.late_target_exec_time:.2f}s. '
-            f'swing_through={self.swing_through}, '
-            f'follow_through_distance={self.follow_through_distance:.3f}m, '
-            f'max_follow_through_distance={self.max_follow_through_distance:.3f}m, '
-            f'follow_through_duration={self.follow_through_duration:.2f}s. '
-            f'vertical_pop_only={self.vertical_pop_only}. '
-            f'recover_after_follow_through={self.recover_after_follow_through}, '
-            f'match_recovery_to_follow_through={self.match_recovery_to_follow_through}, '
-            f'recovery_distance={self.recovery_distance:.3f}m, '
-            f'recovery_duration={self.recovery_duration:.2f}s. '
-            f'sharp_piecewise_velocities={self.sharp_piecewise_velocities}. '
-            f'max_z_rise={self.max_z_rise:.3f}m. '
-            f'one_swing_per_target_burst={self.one_swing_per_target_burst}, '
-            f'allow_retarget_while_busy={self.allow_retarget_while_busy}, '
-            f'rearm_quiet_time={self.rearm_quiet_time:.2f}s. '
-            f'orient_paddle_to_ball_velocity={self.orient_paddle_to_ball_velocity}, '
-            f'fallback_to_current_orientation={self.fallback_to_current_orientation}, '
-            f'paddle_normal_axis={self.paddle_normal_axis}. '
-            f'ee_frame={self.ee_frame}, ik_link_name={self.ik_link_name}, '
-            f'paddle_offset_tool0={self.paddle_offset_tool0.tolist()}. '
+            f'paddle_contact_offset={self.paddle_contact_offset.tolist()}. '
             f'publish_debug_markers={self.publish_debug_markers}. '
             'Waiting for /strike_target...'
         )
@@ -358,503 +153,124 @@ class StrikePlanner(Node):
     # -------------------------------------------------------------- subscriptions
 
     def _on_joint_state(self, msg: JointState):
+        #check for recency?
         with self._lock:
             self.joint_state = msg
 
     def _on_target(self, msg: StrikeTarget):
-        target_msg = msg
-        while target_msg is not None:
-            now_mono = time.monotonic()
-            with self._lock:
-                self._last_target_rx_time = now_mono
-                if self._busy and not self.allow_retarget_while_busy:
-                    self.get_logger().debug(
-                        'Strike busy; ignoring target until pop/recovery completes.'
-                    )
-                    return
-                if self.one_swing_per_target_burst and not self._strike_armed:
-                    self.get_logger().debug('Strike disarmed until target stream goes quiet.')
-                    return
-                if self._planning:
-                    self._pending_target = target_msg
-                    self.get_logger().debug('IK build in progress; keeping latest target pending.')
-                    return
-                self._planning = True
-                self._pending_target = None
-                joint_state = self.joint_state
+        with self._lock:
+            self.strike_target = msg
 
-            accepted = False
-            if joint_state is None:
-                self.get_logger().warn('No joint state yet, dropping target.')
-            else:
-                accepted = self._plan_target(target_msg, joint_state)
-
-            with self._lock:
-                if accepted and self.one_swing_per_target_burst:
-                    self._strike_armed = False
-                self._planning = False
-                target_msg = self._pending_target
-                self._pending_target = None
-                if target_msg is not None:
-                    self.get_logger().debug('Planning latest pending target.')
-
-    def _plan_target(self, msg: StrikeTarget, joint_state: JointState):
+    def _predict(self, msg: StrikeTarget, joint_state: JointState):
+        #Take the striketarget
+        #Take the jointstate
+        #Use ik to find the joint_states to move to, meaning we calculate the target_velocity, target_position for the robot
+        #Return the target_velocity, target_position
         try:
-            tf = self.tf_buffer.lookup_transform(BASE_FRAME, self.ee_frame, Time())
+            tf = self.tf_buffer.lookup_transform(BASE_FRAME, EE_FRAME, Time())
         except TransformException as ex:
-            self.get_logger().warn(f'TF lookup {BASE_FRAME}->{self.ee_frame} failed: {ex}')
-            return False
+            self.get_logger().warn(f'TF lookup {BASE_FRAME}->{EE_FRAME} failed: {ex}')
+            return
 
-        tool_xyz = np.array([
+        start_tool_xyz = np.array([
             tf.transform.translation.x,
             tf.transform.translation.y,
             tf.transform.translation.z,
         ])
-        tool_quat = (
-            tf.transform.rotation.x,
-            tf.transform.rotation.y,
-            tf.transform.rotation.z,
-            tf.transform.rotation.w,
-        )
-        start_xyz = _tool_to_paddle_xyz(tool_xyz, tool_quat, self.paddle_offset_tool0)
-        if self._nominal_paddle_z is None:
-            self._nominal_paddle_z = float(start_xyz[2])
-            self.get_logger().info(
-                f'Locked nominal paddle height at {self._nominal_paddle_z:.3f}m.'
-            )
+        current_qx = tf.transform.rotation.x
+        current_qy = tf.transform.rotation.y
+        current_qz = tf.transform.rotation.z
+        current_qw = tf.transform.rotation.w
+        current_tool_rot = _quat_to_rot(current_qx, current_qy, current_qz, current_qw) # Where our EE is currently
+        start_contact_xyz = start_tool_xyz + current_tool_rot @ self.paddle_contact_offset # Where our tool is currently
 
-        impact_xyz = np.array([
+        impact_contact_xyz = np.array([
             msg.impact_pose.position.x,
             msg.impact_pose.position.y,
             msg.impact_pose.position.z,
         ])
-        if self.apply_objective:
-            impact_xyz = self.objective.apply(
-                impact_xyz,
-                now_sec=self.get_clock().now().nanoseconds * 1e-9,
-            )
 
-        ball_velocity = np.array([
-            msg.ball_velocity_at_impact.x,
-            msg.ball_velocity_at_impact.y,
-            msg.ball_velocity_at_impact.z,
-        ], dtype=np.float64)
-        predicted_tti = msg.time_to_impact.sec + msg.time_to_impact.nanosec * 1e-9
+        raw_contact_xyz = impact_contact_xyz.copy()
 
-        impact_xyz, ball_velocity, predicted_tti = self._retime_for_pop_clearance(
-            impact_xyz,
-            ball_velocity,
-            predicted_tti,
-        )
+        xy_delta = impact_contact_xyz[:2] - start_contact_xyz[:2]
+        xy_norm = float(np.linalg.norm(xy_delta))
+        if xy_norm > self.max_xy_step and xy_norm > 1e-9:
+            impact_contact_xyz[:2] = start_contact_xyz[:2] + (
+                xy_delta / xy_norm # Clamping logic to make the impact the size of self.max_xy_step
+            ) * self.max_xy_step
 
-        if self.lock_contact_height:
-            impact_xyz[2] = self._nominal_paddle_z
+        # Clamp so that z never changes
+        impact_contact_xyz[2] = start_contact_xyz[2]
 
-        impact_xyz[:2] = _clamp_xy_away_from_body(
-            impact_xyz[:2],
-            self.min_body_clearance_radius,
-        )
-
-        if self.limit_target_step:
-            # Optional safety/testing mode: keep each strike inside a small
-            # neighborhood around the current paddle point.
-            xy_delta = impact_xyz[:2] - start_xyz[:2]
-            xy_norm = float(np.linalg.norm(xy_delta))
-            if xy_norm > self.max_xy_step and xy_norm > 1e-9:
-                impact_xyz[:2] = start_xyz[:2] + (xy_delta / xy_norm) * self.max_xy_step
-
-            impact_xyz[:2] = _clamp_xy_away_from_body(
-                impact_xyz[:2],
-                self.min_body_clearance_radius,
-            )
-
-            if not self.lock_contact_height:
-                min_allowed_z = start_xyz[2] - self.max_z_drop
-                if impact_xyz[2] < min_allowed_z:
-                    impact_xyz[2] = min_allowed_z
-                max_allowed_z = start_xyz[2] + self.max_z_rise
-                if impact_xyz[2] > max_allowed_z:
-                    impact_xyz[2] = max_allowed_z
-
-        trajectory_start_xyz = start_xyz.copy()
-        if self.lock_contact_height:
-            trajectory_start_xyz[2] = self._nominal_paddle_z
-
-        if self.orient_paddle_to_ball_velocity:
-            quat = _quat_with_tool_axis_aligned_to_vector(
-                self.paddle_normal_axis,
-                -ball_velocity,
-                tool_quat,
-            )
-            qx, qy, qz, qw = quat
-        elif self.use_current_tool_orientation:
-            qx, qy, qz, qw = tool_quat
+        if self.use_current_tool_orientation:
+            qx = current_qx
+            qy = current_qy
+            qz = current_qz
+            qw = current_qw
         else:
             q = msg.impact_pose.orientation
             qx, qy, qz, qw = q.x, q.y, q.z, q.w
 
+        desired_tool_rot = _quat_to_rot(qx, qy, qz, qw) # Where our EE should be
+        impact_tool_xyz = impact_contact_xyz - desired_tool_rot @ self.paddle_contact_offset # Where our tool should be
+
+        predicted_tti = msg.time_to_impact.sec + msg.time_to_impact.nanosec * 1e-9
         msg_stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         msg_age = max(0.0, now_sec - msg_stamp) if msg_stamp > 0.0 else 0.0
         remaining_to_impact = predicted_tti - msg_age
         exec_time = remaining_to_impact - self.ik_budget
         if exec_time < self.min_exec_time:
-            if self.drop_late_targets:
-                self.get_logger().warn(
-                    f'target too late: predicted={predicted_tti:.3f}s age={msg_age:.3f}s '
-                    f'budget={self.ik_budget:.3f}s remaining_exec={exec_time:.3f}s'
-                )
-                return False
             self.get_logger().warn(
-                f'target timing late; moving to strike pose anyway: '
-                f'predicted={predicted_tti:.3f}s age={msg_age:.3f}s '
-                f'budget={self.ik_budget:.3f}s remaining_exec={exec_time:.3f}s '
-                f'fallback_exec={self.late_target_exec_time:.3f}s'
+                f'target too late: predicted={predicted_tti:.3f}s age={msg_age:.3f}s '
+                f'budget={self.ik_budget:.3f}s remaining_exec={exec_time:.3f}s'
             )
-            exec_time = max(self.min_exec_time, self.late_target_exec_time)
-            remaining_to_impact = exec_time + self.ik_budget
+            return
 
-        build_start = time.monotonic()
-        cart_traj, final_paddle_xyz = self._make_cartesian_trajectory(
-            trajectory_start_xyz,
-            impact_xyz,
-            exec_time,
-        )
-        joint_traj = self._build_joint_trajectory(
-            cart_traj, joint_state, qx, qy, qz, qw
-        )
-        if joint_traj is None and self.fallback_to_current_orientation:
-            self.get_logger().warn(
-                'IK failed with desired paddle orientation; retrying with current tool orientation.'
-            )
-            qx, qy, qz, qw = tool_quat
-            joint_traj = self._build_joint_trajectory(
-                cart_traj, joint_state, qx, qy, qz, qw
-            )
-        if joint_traj is None:
-            return False
+        target_x, target_y, target_z = impact_tool_xyz[0], impact_tool_xyz[1], impact_tool_xyz[2] 
 
-        build_elapsed = time.monotonic() - build_start
-        actual_remaining = remaining_to_impact - build_elapsed
-        if actual_remaining < self.min_exec_time:
-            if self.drop_late_targets:
-                self.get_logger().warn(
-                    f'IK finished too late: build={build_elapsed:.3f}s '
-                    f'actual_remaining={actual_remaining:.3f}s'
-                )
-                return False
-            actual_remaining = exec_time
-
-        # If IK took longer than the reserved budget, begin partway through
-        # the trajectory so the contact waypoint still aligns with impact time.
-        contact_time = getattr(cart_traj, 'contact_time', cart_traj.total_time)
-        elapsed_offset = max(0.0, contact_time - actual_remaining)
-        active_start = self.get_clock().now() - RclpyDuration(seconds=elapsed_offset)
-        with self._lock:
-            self._active_traj = joint_traj
-            self._active_start = active_start
-            self._interp_index = 0
-            self._busy = True
-            self.pid.integral_error = np.zeros(6)
-        self.get_logger().info(
-            f'Strike updated: {self.num_waypoints} waypoints over {exec_time:.2f}s '
-            f'(age={msg_age:.3f}s, IK={build_elapsed:.3f}s) '
-            f'paddle from {trajectory_start_xyz} through {impact_xyz} to {final_paddle_xyz}. '
-            f'limits: max_xy_step={self.max_xy_step:.3f}, '
-            f'max_z_drop={self.max_z_drop:.3f}, max_z_rise={self.max_z_rise:.3f}, '
-            f'locked_z={self._nominal_paddle_z}'
-        )
-        return True
-
-    def _retime_for_pop_clearance(self, impact_xyz, ball_velocity, predicted_tti):
-        if not self.retime_pop_for_ball_clearance:
-            return impact_xyz, ball_velocity, predicted_tti
-        if self._nominal_paddle_z is None:
-            return impact_xyz, ball_velocity, predicted_tti
-
-        desired_ball_z = self._nominal_paddle_z + self.pop_trigger_clearance
-        target_ball_z = self.predictor_strike_height
-
-        # The predictor gives time/velocity at its strike plane. Re-solve the
-        # same ballistic curve relative to that plane so the pop starts when
-        # the ball is one configured clearance above the locked paddle height.
-        a = -0.5 * GRAVITY
-        b = float(ball_velocity[2])
-        c = float(target_ball_z - desired_ball_z)
-        roots = np.roots(np.array([a, b, c], dtype=np.float64))
-
-        candidates = []
-        for root in roots:
-            if abs(root.imag) > 1e-7:
-                continue
-            tau = float(root.real)
-            time_from_msg = float(predicted_tti + tau)
-            if time_from_msg < 0.0:
-                continue
-            vz_at_pop = b - GRAVITY * tau
-            if vz_at_pop <= 0.0:
-                candidates.append((time_from_msg, tau, vz_at_pop))
-
-        if not candidates:
-            self.get_logger().warn(
-                f'Could not retime pop for ball clearance: '
-                f'target_ball_z={target_ball_z:.3f}m, '
-                f'desired_ball_z={desired_ball_z:.3f}m, '
-                f'vz={b:.3f}m/s. Using predictor timing.',
-                throttle_duration_sec=1.0,
-            )
-            return impact_xyz, ball_velocity, predicted_tti
-
-        new_tti, tau, vz_at_pop = min(candidates, key=lambda candidate: candidate[0])
-        retimed_impact_xyz = np.array(impact_xyz, dtype=np.float64).copy()
-        retimed_ball_velocity = np.array(ball_velocity, dtype=np.float64).copy()
-        retimed_impact_xyz[:2] += retimed_ball_velocity[:2] * tau
-        retimed_ball_velocity[2] = vz_at_pop
-
-        self.get_logger().info(
-            f'Pop retimed for ball clearance: clearance={self.pop_trigger_clearance:.3f}m, '
-            f'ball_z={desired_ball_z:.3f}m, '
-            f'tti {predicted_tti:.3f}s -> {new_tti:.3f}s.',
-            throttle_duration_sec=0.5,
-        )
-        return retimed_impact_xyz, retimed_ball_velocity, new_tti
-
-    # ---------------------------------------------------------- trajectory build
-
-    def _make_cartesian_trajectory(self, start_xyz, impact_xyz, exec_time):
-        start_xyz = np.asarray(start_xyz, dtype=np.float64).copy()
-        impact_xyz = np.asarray(impact_xyz, dtype=np.float64).copy()
-        if self.lock_contact_height:
-            locked_z = (
-                self._nominal_paddle_z
-                if self._nominal_paddle_z is not None
-                else start_xyz[2]
-            )
-            start_xyz[2] = locked_z
-            impact_xyz[2] = locked_z
-
-        if not self.swing_through:
-            return LinearTrajectory(start_xyz, impact_xyz, exec_time), impact_xyz
-
-        direction = np.asarray(self.follow_through_direction, dtype=np.float64)
-        if self.vertical_pop_only:
-            direction = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-        norm = float(np.linalg.norm(direction))
-        if norm < 1e-9:
-            self.get_logger().warn(
-                'follow_through_direction is near zero; disabling follow-through.',
-                throttle_duration_sec=5.0,
-            )
-            return LinearTrajectory(start_xyz, impact_xyz, exec_time), impact_xyz
-        else:
-            direction = direction / norm
-
-        follow_distance = min(
-            max(0.0, self.follow_through_distance),
-            max(0.0, self.max_follow_through_distance),
-        )
-        follow_xyz = impact_xyz + direction * follow_distance
-        if self.lock_contact_height:
-            follow_xyz[2] = impact_xyz[2]
-        follow_duration = max(0.0, self.follow_through_duration)
-        follow_time = exec_time + follow_duration
-        if follow_time <= exec_time + 1e-6:
-            return LinearTrajectory(start_xyz, impact_xyz, exec_time), impact_xyz
-
-        times = [0.0, exec_time, follow_time]
-        positions = [start_xyz, impact_xyz, follow_xyz]
-        final_xyz = follow_xyz
-
-        recovery_duration = max(0.0, self.recovery_duration)
-        if self.recover_after_follow_through and recovery_duration > 1e-6:
-            recovery_xyz = follow_xyz.copy()
-            recovery_xyz[2] = (
-                self._nominal_paddle_z
-                if self._nominal_paddle_z is not None
-                else start_xyz[2]
-            )
-            recovery_time = follow_time + recovery_duration
-            times.append(recovery_time)
-            positions.append(recovery_xyz)
-            final_xyz = recovery_xyz
-
-        return (
-            PiecewiseLinearTrajectory(
-                times=times,
-                positions=positions,
-            ),
-            final_xyz,
+        req_qx, req_qy, req_qz, req_qw = qx, qy, qz, qw
+        sol = self.ik_planner.compute_ik(
+            current_joint_state=joint_state,
+            x=target_x, y=target_y, z=target_z,
+            qx=req_qx, qy=req_qy, qz=req_qz, qw=req_qw,
+            ik_link_name=self.ik_link_name,
+            timeout_sec=self.ik_timeout,
         )
 
-    def _build_joint_trajectory(self, cart_traj, joint_state, qx, qy, qz, qw):
-        times = np.linspace(0.0, cart_traj.total_time, self.num_waypoints)
-        if hasattr(cart_traj, 'key_times'):
-            times = np.unique(np.concatenate([times, np.array(cart_traj.key_times)]))
-        positions = []
-        cart_points = [cart_traj.target_pose(t) for t in times]
-        waypoint_quats = []
-        waypoint_success = [True] * len(times)
-        seed_state = joint_state
-        start_pose = cart_points[0]
-        end_pose = cart_points[-1]
-        self.get_logger().info(
-            'IK build start: '
-            f'waypoints={self.num_waypoints}, total_time={cart_traj.total_time:.3f}s, '
-            f'start=({start_pose[0]:.4f},{start_pose[1]:.4f},{start_pose[2]:.4f}), '
-            f'end=({end_pose[0]:.4f},{end_pose[1]:.4f},{end_pose[2]:.4f}), '
-            f'quat=({qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f})'
-        )
-        for i, t in enumerate(times):
-            if i == 0:
-                positions.append(_reorder_positions(joint_state, JOINT_ORDER))
-                waypoint_quats.append((qx, qy, qz, qw))
-                continue
-            pose = cart_points[i]
-
-            if i == len(times) - 1:
-                # Only final waypoint uses desired impact orientation.
-                req_qx, req_qy, req_qz, req_qw = qx, qy, qz, qw
-            else:
-                # Keep the same tool orientation so the paddle offset maps
-                # consistently from contact point to IK link.
-                req_qx, req_qy, req_qz, req_qw = qx, qy, qz, qw
-            tool_pose = _paddle_to_tool_xyz(
-                pose[:3],
-                (req_qx, req_qy, req_qz, req_qw),
-                self.paddle_offset_tool0,
-            )
-            self.get_logger().info(
-                f'IK waypoint {i + 1}/{len(times)}: '
-                f'paddle=({pose[0]:.4f},{pose[1]:.4f},{pose[2]:.4f}) '
-                f'tool=({tool_pose[0]:.4f},{tool_pose[1]:.4f},{tool_pose[2]:.4f}) '
-                f'quat=({req_qx:.4f},{req_qy:.4f},{req_qz:.4f},{req_qw:.4f})'
-            )
-            sol = self.ik_planner.compute_ik(
-                seed_state,
-                tool_pose[0], tool_pose[1], tool_pose[2],
-                qx=req_qx, qy=req_qy, qz=req_qz, qw=req_qw,
-                ik_link_name=self.ik_link_name,
-                timeout_sec=self.ik_timeout,
-            )
-            waypoint_quats.append((req_qx, req_qy, req_qz, req_qw))
-            if sol is None:
-                waypoint_success[i] = False
-                self._publish_debug_visuals(
-                    cart_points,
-                    waypoint_quats,
-                    waypoint_success,
-                    failed_index=i,
-                )
-                self.get_logger().error(
-                    f'IK failed at waypoint {i + 1}/{self.num_waypoints} '
-                    f'(t={t:.3f}s, xyz={pose[:3]}). Aborting strike. '
-                    f'quat=({qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f}), '
-                    f'joint_state={_current_joint_summary(joint_state, JOINT_ORDER)}'
-                )
-                return None
-            positions.append(_reorder_positions(sol, JOINT_ORDER))
-            seed_state = sol
-
-        self._publish_debug_visuals(
-            cart_points,
-            waypoint_quats,
-            waypoint_success,
-            failed_index=None,
-        )
-
-        positions = np.array(positions)
-        if self.sharp_piecewise_velocities and hasattr(cart_traj, 'key_times'):
-            velocities = _piecewise_segment_velocities(positions, times)
-        else:
-            velocities = _finite_diff(positions, times)
-
-        joint_traj = JointTrajectory()
-        joint_traj.joint_names = list(JOINT_ORDER)
-        for t, p, v in zip(times, positions, velocities):
-            point = JointTrajectoryPoint()
-            point.positions = p.tolist()
-            point.velocities = v.tolist()
-            sec = int(t)
-            point.time_from_start = Duration(sec=sec, nanosec=int((t - sec) * 1e9))
-            joint_traj.points.append(point)
-        return joint_traj
+        return sol
 
     # ---------------------------------------------------------------- 10 Hz loop
-
     def _control_tick(self):
         with self._lock:
-            busy = self._busy
-            active_traj = self._active_traj
-            active_start = self._active_start
-            interp_index = self._interp_index
+            if self._busy or self.joint_state is None or self.strike_target is None:
+                return
+            self._busy = True
             joint_state = self.joint_state
+            target = self.strike_target
 
-        if not busy or active_traj is None or active_start is None or joint_state is None:
-            self._maybe_rearm_after_quiet()
-            return
-
-        elapsed = (self.get_clock().now() - active_start).nanoseconds * 1e-9
-        total_time = _last_time(active_traj)
-        current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
-
-        if elapsed >= total_time:
-            final_pos = np.array(active_traj.points[-1].positions)
-            final_vel = np.zeros(6)
-            pos_error = final_pos - current_pos
-            max_pos_error = float(np.max(np.abs(pos_error)))
-            max_vel = float(np.max(np.abs(current_vel)))
-
-            settled = (
-                max_pos_error <= self.settle_position_tolerance
-                and max_vel <= self.settle_velocity_tolerance
-            )
-            timed_out = (
-                self.settle_timeout > 0.0
-                and elapsed >= total_time + self.settle_timeout
-            )
-
-            if settled or timed_out:
-                self._publish_velocity(np.zeros(6))
-                self.pid.integral_error = np.zeros(6)
-                with self._lock:
-                    self._busy = False
-                    self._active_traj = None
-                if timed_out and not settled:
-                    self.get_logger().warn(
-                        f'Strike settle timeout (t={elapsed:.2f}s, '
-                        f'max_joint_error={max_pos_error:.3f} rad).'
-                    )
-                else:
-                    self.get_logger().info(f'Strike complete (t={elapsed:.2f}s).')
-                self._maybe_rearm_after_quiet()
+        try:
+            current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
+            sol = self._predict(target, joint_state)
+            if sol is None:
                 return
 
-            cmd = self.pid.step_control(final_pos, final_vel, current_pos, current_vel)
+            target_joint_states = _reorder_positions(sol, JOINT_ORDER)
+
+            if self.simple_motion:
+                err = target_joint_states - current_pos
+                err = (err + np.pi) % (2 * np.pi) - np.pi
+                cmd = np.clip(self.Kq * err, -0.4, 0.4)
+            else:
+                # leave disabled for now
+                return
+
             self._publish_velocity(cmd)
-            return
 
-        target_pos, target_vel, next_index = _interpolate(
-            active_traj, elapsed, interp_index
-        )
-        with self._lock:
-            if self._active_traj is active_traj:
-                self._interp_index = next_index
-        cmd = self.pid.step_control(target_pos, target_vel, current_pos, current_vel)
-        self._publish_velocity(cmd)
+        finally:
+            with self._lock:
+                self._busy = False
 
-    def _maybe_rearm_after_quiet(self):
-        if not self.one_swing_per_target_burst:
-            return
-        now_mono = time.monotonic()
-        with self._lock:
-            if self._strike_armed or self._busy or self._planning:
-                return
-            if self._last_target_rx_time is None:
-                return
-            if now_mono - self._last_target_rx_time < self.rearm_quiet_time:
-                return
-            self._strike_armed = True
-        self.get_logger().info('Strike re-armed after target stream went quiet.')
 
     def _publish_velocity(self, cmd):
         msg = Float64MultiArray()
@@ -885,137 +301,6 @@ class StrikePlanner(Node):
             deactivate='forward_velocity_controller',
         )
 
-    # ---------------------------------------------------------- RViz debugging
-
-    def _publish_debug_visuals(self, cart_points, waypoint_quats, waypoint_success, failed_index):
-        if self.debug_marker_pub is None or self.debug_pose_pub is None:
-            return
-
-        # Transform base_link points into the RViz fixed frame so markers render
-        # regardless of whether fixed frame is 'world' or 'base_link'.
-        target_frame = self.debug_marker_frame
-        pts_in_target = cart_points  # default: same frame, no transform needed
-        rot = None
-        trans = None
-        if target_frame != BASE_FRAME:
-            try:
-                tf_t = self.tf_buffer.lookup_transform(
-                    target_frame, BASE_FRAME, Time()
-                )
-                q = tf_t.transform.rotation
-                t = tf_t.transform.translation
-                rot = _quat_to_rot(q.x, q.y, q.z, q.w)
-                trans = np.array([t.x, t.y, t.z])
-                pts_in_target = [
-                    rot @ np.array([float(p[0]), float(p[1]), float(p[2])]) + trans
-                    for p in cart_points
-                ]
-            except TransformException:
-                self.get_logger().warn(
-                    f'Debug markers: TF lookup {BASE_FRAME}->{target_frame} failed; '
-                    f'publishing in {BASE_FRAME} instead.',
-                    throttle_duration_sec=5.0,
-                )
-                target_frame = BASE_FRAME
-                pts_in_target = cart_points
-
-        stamp = Time().to_msg()
-
-        pose_array = PoseArray()
-        pose_array.header.frame_id = target_frame
-        pose_array.header.stamp = stamp
-        for pt, quat in zip(pts_in_target, waypoint_quats):
-            p = Pose()
-            p.position.x = float(pt[0])
-            p.position.y = float(pt[1])
-            p.position.z = float(pt[2])
-            p.orientation.x = float(quat[0])
-            p.orientation.y = float(quat[1])
-            p.orientation.z = float(quat[2])
-            p.orientation.w = float(quat[3])
-            pose_array.poses.append(p)
-        self.debug_pose_pub.publish(pose_array)
-
-        markers = MarkerArray()
-
-        clear = Marker()
-        clear.header.frame_id = target_frame
-        clear.header.stamp = stamp
-        clear.action = Marker.DELETEALL
-        markers.markers.append(clear)
-
-        path = Marker()
-        path.header.frame_id = target_frame
-        path.header.stamp = stamp
-        path.ns = 'strike_path'
-        path.id = 1
-        path.type = Marker.LINE_STRIP
-        path.action = Marker.ADD
-        path.scale.x = 0.008
-        path.color.r = 0.05
-        path.color.g = 0.75
-        path.color.b = 1.00
-        path.color.a = 1.00
-        for pt in pts_in_target:
-            p = Point()
-            p.x = float(pt[0])
-            p.y = float(pt[1])
-            p.z = float(pt[2])
-            path.points.append(p)
-        markers.markers.append(path)
-
-        waypoints = Marker()
-        waypoints.header.frame_id = target_frame
-        waypoints.header.stamp = stamp
-        waypoints.ns = 'strike_waypoints'
-        waypoints.id = 2
-        waypoints.type = Marker.SPHERE_LIST
-        waypoints.action = Marker.ADD
-        waypoints.scale.x = 0.025
-        waypoints.scale.y = 0.025
-        waypoints.scale.z = 0.025
-
-        for idx, pt in enumerate(pts_in_target):
-            p = Point()
-            p.x = float(pt[0])
-            p.y = float(pt[1])
-            p.z = float(pt[2])
-            waypoints.points.append(p)
-
-            color = _rgba(0.20, 0.85, 0.20, 1.00)
-            if failed_index is not None and idx == failed_index:
-                color = _rgba(0.95, 0.10, 0.10, 1.00)
-            elif not waypoint_success[idx]:
-                color = _rgba(0.95, 0.10, 0.10, 1.00)
-            elif idx == len(pts_in_target) - 1:
-                color = _rgba(1.00, 0.70, 0.10, 1.00)
-            waypoints.colors.append(color)
-
-        markers.markers.append(waypoints)
-
-        if failed_index is not None:
-            failed_pt = pts_in_target[failed_index]
-            text = Marker()
-            text.header.frame_id = target_frame
-            text.header.stamp = stamp
-            text.ns = 'strike_failure'
-            text.id = 3
-            text.type = Marker.TEXT_VIEW_FACING
-            text.action = Marker.ADD
-            text.scale.z = 0.05
-            text.color.r = 1.0
-            text.color.g = 0.2
-            text.color.b = 0.2
-            text.color.a = 1.0
-            text.pose.position.x = float(failed_pt[0])
-            text.pose.position.y = float(failed_pt[1])
-            text.pose.position.z = float(failed_pt[2] + 0.06)
-            text.pose.orientation.w = 1.0
-            text.text = f'IK FAIL wp {failed_index + 1}/{len(pts_in_target)}'
-            markers.markers.append(text)
-
-        self.debug_marker_pub.publish(markers)
-
 
 # ------------------------------------------------------------------- helpers
 
@@ -1040,165 +325,6 @@ def _current_joint_summary(joint_state: JointState, order):
     values = [f'{n}={name_to_pos.get(n, float("nan")):.3f}' for n in order]
     return ', '.join(values)
 
-
-def _tool_to_paddle_xyz(tool_xyz, tool_quat, paddle_offset_tool0):
-    return np.asarray(tool_xyz, dtype=np.float64) + (
-        _quat_to_rot(*tool_quat) @ np.asarray(paddle_offset_tool0, dtype=np.float64)
-    )
-
-
-def _paddle_to_tool_xyz(paddle_xyz, tool_quat, paddle_offset_tool0):
-    return np.asarray(paddle_xyz, dtype=np.float64) - (
-        _quat_to_rot(*tool_quat) @ np.asarray(paddle_offset_tool0, dtype=np.float64)
-    )
-
-
-def _clamp_xy_away_from_body(xy, min_radius):
-    min_radius = max(0.0, float(min_radius))
-    point = np.asarray(xy, dtype=np.float64).copy()
-    if min_radius <= 0.0:
-        return point
-    radius = float(np.linalg.norm(point))
-    if radius >= min_radius:
-        return point
-    if radius < 1e-9:
-        return np.array([min_radius, 0.0], dtype=np.float64)
-    return point * (min_radius / radius)
-
-
-def _quat_with_tool_axis_aligned_to_vector(axis_name, target_vector, fallback_quat):
-    target = np.asarray(target_vector, dtype=np.float64)
-    target_norm = float(np.linalg.norm(target))
-    if target_norm < 1e-6:
-        return fallback_quat
-    target = target / target_norm
-
-    local_axis = _axis_name_to_vector(axis_name)
-    if local_axis is None:
-        return fallback_quat
-
-    # Pick a local secondary axis and a world reference to resolve wrist roll.
-    secondary_local = np.array([0.0, 0.0, 1.0])
-    world_ref = np.array([0.0, 0.0, 1.0])
-    if abs(float(np.dot(local_axis, secondary_local))) > 0.9:
-        secondary_local = np.array([1.0, 0.0, 0.0])
-    if abs(float(np.dot(target, world_ref))) > 0.9:
-        world_ref = np.array([1.0, 0.0, 0.0])
-
-    local_secondary = _orthogonal_unit(secondary_local, local_axis)
-    world_secondary = _orthogonal_unit(world_ref, target)
-
-    local_third = np.cross(local_axis, local_secondary)
-    world_third = np.cross(target, world_secondary)
-
-    local_basis = np.column_stack((local_axis, local_secondary, local_third))
-    world_basis = np.column_stack((target, world_secondary, world_third))
-    rot = world_basis @ local_basis.T
-    return _rot_to_quat(rot)
-
-
-def _axis_name_to_vector(axis_name):
-    axes = {
-        'x': np.array([1.0, 0.0, 0.0]),
-        '+x': np.array([1.0, 0.0, 0.0]),
-        '-x': np.array([-1.0, 0.0, 0.0]),
-        'y': np.array([0.0, 1.0, 0.0]),
-        '+y': np.array([0.0, 1.0, 0.0]),
-        '-y': np.array([0.0, -1.0, 0.0]),
-        'z': np.array([0.0, 0.0, 1.0]),
-        '+z': np.array([0.0, 0.0, 1.0]),
-        '-z': np.array([0.0, 0.0, -1.0]),
-    }
-    return axes.get(str(axis_name).lower())
-
-
-def _orthogonal_unit(reference, normal):
-    projected = np.asarray(reference, dtype=np.float64) - (
-        float(np.dot(reference, normal)) * np.asarray(normal, dtype=np.float64)
-    )
-    norm = float(np.linalg.norm(projected))
-    if norm < 1e-9:
-        return np.array([1.0, 0.0, 0.0])
-    return projected / norm
-
-
-def _finite_diff(positions, times):
-    n = len(times)
-    velocities = np.zeros_like(positions)
-    if n < 2:
-        return velocities
-    velocities[0] = (positions[1] - positions[0]) / (times[1] - times[0])
-    velocities[-1] = (positions[-1] - positions[-2]) / (times[-1] - times[-2])
-    for i in range(1, n - 1):
-        velocities[i] = (positions[i + 1] - positions[i - 1]) / (times[i + 1] - times[i - 1])
-    return velocities
-
-
-def _piecewise_segment_velocities(positions, times):
-    n = len(times)
-    velocities = np.zeros_like(positions)
-    if n < 2:
-        return velocities
-    segment_velocities = []
-    for i in range(n - 1):
-        dt = max(1e-6, float(times[i + 1] - times[i]))
-        segment_velocities.append((positions[i + 1] - positions[i]) / dt)
-    velocities[0] = segment_velocities[0]
-    for i in range(1, n - 1):
-        velocities[i] = segment_velocities[i]
-    velocities[-1] = segment_velocities[-1]
-    return velocities
-
-
-def _last_time(joint_traj: JointTrajectory) -> float:
-    last = joint_traj.points[-1].time_from_start
-    return last.sec + last.nanosec * 1e-9
-
-
-def _interpolate(joint_traj: JointTrajectory, t, current_index):
-    """Adapted from lab7/visual_servoing/main.py:506-562."""
-    eps = 1e-4
-    max_index = len(joint_traj.points) - 1
-
-    cur_t = (joint_traj.points[current_index].time_from_start.sec
-             + joint_traj.points[current_index].time_from_start.nanosec * 1e-9)
-    if cur_t > t:
-        current_index = 0
-
-    while (current_index < max_index and
-           joint_traj.points[current_index + 1].time_from_start.sec
-           + joint_traj.points[current_index + 1].time_from_start.nanosec * 1e-9
-           < t + eps):
-        current_index += 1
-
-    if current_index < max_index:
-        t_lo = (joint_traj.points[current_index].time_from_start.sec
-                + joint_traj.points[current_index].time_from_start.nanosec * 1e-9)
-        t_hi = (joint_traj.points[current_index + 1].time_from_start.sec
-                + joint_traj.points[current_index + 1].time_from_start.nanosec * 1e-9)
-        p_lo = np.array(joint_traj.points[current_index].positions)
-        p_hi = np.array(joint_traj.points[current_index + 1].positions)
-        v_lo = np.array(joint_traj.points[current_index].velocities)
-        v_hi = np.array(joint_traj.points[current_index + 1].velocities)
-        alpha = (t - t_lo) / (t_hi - t_lo) if t_hi != t_lo else 0.0
-        target_pos = p_lo + alpha * (p_hi - p_lo)
-        target_vel = v_lo + alpha * (v_hi - v_lo)
-    else:
-        target_pos = np.array(joint_traj.points[current_index].positions)
-        target_vel = np.array(joint_traj.points[current_index].velocities)
-
-    return target_pos, target_vel, current_index
-
-
-def _rgba(r, g, b, a):
-    c = Marker().color
-    c.r = float(r)
-    c.g = float(g)
-    c.b = float(b)
-    c.a = float(a)
-    return c
-
-
 def _quat_to_rot(x, y, z, w):
     """Quaternion (x, y, z, w) → 3×3 rotation matrix."""
     return np.array([
@@ -1206,39 +332,6 @@ def _quat_to_rot(x, y, z, w):
         [    2*(x*y + w*z), 1 - 2*(x*x + z*z),     2*(y*z - w*x)],
         [    2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x*x + y*y)],
     ])
-
-
-def _rot_to_quat(rot):
-    """3x3 rotation matrix -> quaternion (x, y, z, w)."""
-    m = np.asarray(rot, dtype=np.float64)
-    trace = float(np.trace(m))
-    if trace > 0.0:
-        s = 0.5 / np.sqrt(trace + 1.0)
-        qw = 0.25 / s
-        qx = (m[2, 1] - m[1, 2]) * s
-        qy = (m[0, 2] - m[2, 0]) * s
-        qz = (m[1, 0] - m[0, 1]) * s
-    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = 2.0 * np.sqrt(max(0.0, 1.0 + m[0, 0] - m[1, 1] - m[2, 2]))
-        qw = (m[2, 1] - m[1, 2]) / s
-        qx = 0.25 * s
-        qy = (m[0, 1] + m[1, 0]) / s
-        qz = (m[0, 2] + m[2, 0]) / s
-    elif m[1, 1] > m[2, 2]:
-        s = 2.0 * np.sqrt(max(0.0, 1.0 + m[1, 1] - m[0, 0] - m[2, 2]))
-        qw = (m[0, 2] - m[2, 0]) / s
-        qx = (m[0, 1] + m[1, 0]) / s
-        qy = 0.25 * s
-        qz = (m[1, 2] + m[2, 1]) / s
-    else:
-        s = 2.0 * np.sqrt(max(0.0, 1.0 + m[2, 2] - m[0, 0] - m[1, 1]))
-        qw = (m[1, 0] - m[0, 1]) / s
-        qx = (m[0, 2] + m[2, 0]) / s
-        qy = (m[1, 2] + m[2, 1]) / s
-        qz = 0.25 * s
-    quat = np.array([qx, qy, qz, qw], dtype=np.float64)
-    quat /= max(1e-12, float(np.linalg.norm(quat)))
-    return tuple(quat.tolist())
 
 
 def main(args=None):
