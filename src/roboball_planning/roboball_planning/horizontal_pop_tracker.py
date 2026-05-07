@@ -76,16 +76,16 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('min_pop_interval', 0.10).value
         )
         self.descending_velocity_threshold = float(
-            self.declare_parameter('descending_velocity_threshold', -0.05).value
+            self.declare_parameter('descending_velocity_threshold', -0.03).value
         )
         self.hit_velocity_gain = float(
-            self.declare_parameter('hit_velocity_gain', 1.2).value
+            self.declare_parameter('hit_velocity_gain', 2).value
         )
         self.min_hit_velocity = float(
-            self.declare_parameter('min_hit_velocity', 0.15).value
+            self.declare_parameter('min_hit_velocity', 0.05).value
         )
         self.max_hit_velocity = float(
-            self.declare_parameter('max_hit_velocity', 0.80).value
+            self.declare_parameter('max_hit_velocity', 3.0).value
         )
         self._pop_paddle_velocity = 0.0
         configured_contact_height = float(
