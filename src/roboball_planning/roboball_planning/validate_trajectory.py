@@ -39,9 +39,7 @@ class TrajectoryValidator(Node):
             self.get_logger().error('Joint names do not match expected joint names!')
             return
 
-        if len(msg.points) != 1:
-            self.get_logger().error('Trajectory should only have one point!')
-            return
+        
 
         point = msg.points[0]
         target_positions = point.positions
