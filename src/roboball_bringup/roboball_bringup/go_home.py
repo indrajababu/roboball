@@ -46,12 +46,22 @@ At time 1778146688.346375015
  -0.997  0.024  0.074  0.055
   0.000  0.000  0.000  1.000
 
+  HOME_POSITIONS = [
+    -2.316411157647604,   # shoulder_lift_joint
+    -1.810107946395874,  # elbow_joint
+    4.19159265,   # wrist_1_joint
+    5.211,   # wrist_2_joint
+    -1.5386202971087855,  # wrist_3_joint
+    5.799105644226074,    # shoulder_pan_joint
+]
+
+
 """
 # Home pose copied from the known-good joint-space state you pasted.
 # This is NOT an IK target. These are direct joint angles in radians.
 HOME_POSITIONS = [
     -2.316411157647604,   # shoulder_lift_joint
-    -1.810107946395874,   # elbow_joint
+    -1.810107946395874,  # elbow_joint
     1.0502943235584716,   # wrist_1_joint
     2.0732617378234863,   # wrist_2_joint
     -1.5386202971087855,  # wrist_3_joint

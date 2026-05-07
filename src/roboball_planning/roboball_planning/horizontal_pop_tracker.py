@@ -50,21 +50,21 @@ class HorizontalPopTracker(Node):
 
         self.control_period = float(self.declare_parameter('control_period', 0.02).value)
         self.pop_height = min(
-            float(self.declare_parameter('pop_height', 6.0 * INCH_TO_M).value),
+            float(self.declare_parameter('pop_height', 9.0 * INCH_TO_M).value),
             6.0 * INCH_TO_M,
         )
         self.max_vertical_rise = min(
-            float(self.declare_parameter('max_vertical_rise', 6.0 * INCH_TO_M).value),
+            float(self.declare_parameter('max_vertical_rise', 9.0 * INCH_TO_M).value),
             6.0 * INCH_TO_M,
         )
         self.pop_trigger_clearance = float(
             self.declare_parameter('pop_trigger_clearance', 17.5 * INCH_TO_M).value
         )
         self.pop_hold_duration = float(
-            self.declare_parameter('pop_hold_duration', 0.03).value
+            self.declare_parameter('pop_hold_duration', 0.01).value
         )
         self.recovery_duration = float(
-            self.declare_parameter('recovery_duration', 0.7).value
+            self.declare_parameter('recovery_duration', 0.5).value
         )
         self.pop_rearm_hysteresis = float(
             self.declare_parameter('pop_rearm_hysteresis', 0.02).value
@@ -73,7 +73,7 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('lock_contact_height', True).value
         )
         self.min_pop_interval = float(
-            self.declare_parameter('min_pop_interval', 0.15).value
+            self.declare_parameter('min_pop_interval', 0.10).value
         )
         self.descending_velocity_threshold = float(
             self.declare_parameter('descending_velocity_threshold', -0.05).value
