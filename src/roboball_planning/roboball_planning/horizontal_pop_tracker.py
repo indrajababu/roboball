@@ -38,7 +38,7 @@ DEFAULT_BALL_TO_PADDLE_OFFSET = [-0.082, 0.094, 0.116]
 # Pure 90° rotation about base_link y. With the paddle mounted square on tool0,
 # this puts the paddle face normal exactly along base_link +z (perfectly
 # horizontal). (qx, qy, qz, qw).
-HORIZONTAL_TOOL_QUAT = (0.0, float(np.sqrt(0.5)), 0.0, float(np.sqrt(0.5)))
+#HORIZONTAL_TOOL_QUAT = (0.0, float(np.sqrt(0.5)), 0.0, float(np.sqrt(0.5)))
 
 
 class HorizontalPopTracker(Node):
@@ -93,7 +93,7 @@ class HorizontalPopTracker(Node):
         )
         self._pop_paddle_velocity = 0.0
         configured_contact_height = float(
-            self.declare_parameter('contact_height', float('nan')).value
+            self.declare_parameter('contact_height', .38).value
         )
         self.contact_height = (
             configured_contact_height
@@ -104,7 +104,7 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('min_body_clearance_radius', 0.30).value
         )
         self.ball_timeout = float(self.declare_parameter('ball_timeout', 0.35).value)
-        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.06).value)
+        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.2).value)
         self.max_joint_speed = float(
             self.declare_parameter('max_joint_speed', 1.0).value
         )
@@ -163,7 +163,7 @@ class HorizontalPopTracker(Node):
         self.ball_state = None
         self.ball_rx_time = None
         self._nominal_paddle_z = self.contact_height
-        self._locked_tool_quat = HORIZONTAL_TOOL_QUAT
+        self._locked_tool_quat = (0, 0, 0, 1)
         self._last_target_xy = None
         self._state = self.TRACK
         self._pop_start_time = None
@@ -271,6 +271,10 @@ class HorizontalPopTracker(Node):
             self.paddle_offset_tool0,
         )
 
+        if self._locked_tool_quat is None:
+            self._locked_tool_quat = tool_quat
+
+        
         if self._nominal_paddle_z is None:
             self._nominal_paddle_z = float(current_paddle_xyz[2])
             self.get_logger().info(

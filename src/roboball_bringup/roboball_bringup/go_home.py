@@ -72,7 +72,7 @@ HOME_POSITIONS_2 = [
     -2.316411157647604,   # shoulder_lift_joint
     -1.810107946395874,  # elbow_joint
     -0.5205,   # wrist_1_joint
-    3.644056333,   # wrist_2_joint
+    0.49920367,   # wrist_2_joint
     -1.5386202971087855,  # wrist_3_joint
     5.799105644226074,    # shoulder_pan_joint
 ]
@@ -82,7 +82,7 @@ HOME_POSITIONS_3 = [
     -2.316411157647604,   # shoulder_lift_joint
     -1.810107946395874,  # elbow_joint
     -2.09159,   # wrist_1_joint
-    5.211,   # wrist_2_joint
+    -1.07159265,   # wrist_2_joint
     -1.5386202971087855,  # wrist_3_joint
     5.799105644226074,    # shoulder_pan_joint
 ]
