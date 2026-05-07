@@ -331,8 +331,6 @@ class HorizontalPopTracker(Node):
             current_paddle_z=float(current_paddle_xyz[2]),
             over_ceiling=over_ceiling,
         )
-        
-        target_z = target_z + self.smooth_bump(self._last_pop_time)
 
         target_paddle_xyz = np.array([
             target_xy[0],
@@ -494,13 +492,13 @@ class HorizontalPopTracker(Node):
             if self._pop_start_time is None:
                 return self._nominal_paddle_z
             
-            elapsed = now_mono - self._last_pop_time
+            elapsed = now_mono - self._pop_start_time
             progress = elapsed / self.pop_duration
 
             pop_scale = self.smooth_bump(progress=progress)
 
             return min(
-                current_paddle_z + self.pop_height * pop_scale,
+                self._nominal_paddle_z + self.pop_height * pop_scale,
                 ceiling_z,
             )
 
