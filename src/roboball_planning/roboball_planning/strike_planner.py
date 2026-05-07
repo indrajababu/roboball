@@ -52,7 +52,7 @@ JOINT_ORDER = [
     'wrist_3_joint',
 ]
 
-NUM_WAYPOINTS = 2
+NUM_WAYPOINTS = 1
 CONTROL_PERIOD_S = 0.1
 BASE_FRAME = 'base_link'
 EE_FRAME = 'tool0'
@@ -79,8 +79,8 @@ class StrikePlanner(Node):
         self.max_xy_step = float(self.declare_parameter('max_xy_step', 0.12).value)
         self.max_z_drop = float(self.declare_parameter('max_z_drop', 0.02).value)
         self.min_exec_time = float(self.declare_parameter('min_exec_time', 0.12).value)
-        self.ik_budget = float(self.declare_parameter('ik_budget', 0.08).value)
-        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.25).value)
+        self.ik_budget = float(self.declare_parameter('ik_budget', 0.09).value)
+        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.06).value)
         self.publish_debug_markers = bool(
             self.declare_parameter('publish_debug_markers', True).value
         )

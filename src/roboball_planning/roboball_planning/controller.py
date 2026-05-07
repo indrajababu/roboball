@@ -156,7 +156,7 @@ class PIDJointVelocityController(Controller):
 
         self.node.get_logger().info("Initialized PID Joint Velocity Controller")
 
-    def step_control(self, target_position, target_velocity, current_position, current_velocity):
+    def step_control(self, target_position, target_velocity, current_position, current_velocity, dt):
         """
         Calculate control input using PID control.
 
@@ -186,7 +186,6 @@ class PIDJointVelocityController(Controller):
         """
 
         # dt matches the 10 Hz control loop timer period
-        dt = 0.1
 
         position_error = target_position - current_position
         velocity_error = target_velocity - current_velocity
