@@ -105,6 +105,8 @@ class StrikePlanner(Node):
         self.joint_state = None
         self.strike_target = None
 
+        self.joint_target = None
+        
         self.create_subscription(
             JointState, '/joint_states', self._on_joint_state, 10,
             callback_group=self._cb_group,
@@ -249,11 +251,11 @@ class StrikePlanner(Node):
             target = self.strike_target
 
         current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
-        target_joint_states = _reorder_positions(self._predict(target, joint_state))
+        target_joint_states = self._predict(target, joint_state)
         arr_target_joint_states = np.array([target_joint_states.position[i] for i in range(len(JOINT_ORDER))])
 
         if self.simple_motion:
-            cmd = self.Kq * (arr_target_joint_states - current_pos)
+            cmd = self.Kq * (arr_target_joint_states - joint_state)
         else:
             #How do we calculate target_pos and target_vel? 
             target_pos = _reorder_positions(target_joint_states, JOINT_ORDER)

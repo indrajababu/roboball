@@ -8,7 +8,7 @@ Launches, in order:
   - Trajectory validator (safety layer in front of the UR trajectory controller)
   - Ball detector (publishes /ball_pose), default detector: HSV
   - Trajectory predictor (publishes /strike_target)
-  - Strike planner (gated off by default — see start_strike_planner)
+  - Horizontal pop tracker (gated off by default — see start_strike_planner)
 
 Seeded from lab5/planning/launch/lab5_bringup.launch.py.
 
@@ -19,7 +19,7 @@ Optional args:
   ur_type:=ur7e                      — robot type forwarded to ur_moveit_config
   detector:=hsv|yolo                 — ball_detector backend (default hsv)
   strike_height:=<meters>            — strike-plane Z in base_link (default 0.60)
-  start_strike_planner:=true|false   — auto-start the strike planner (default false).
+  start_strike_planner:=true|false   — auto-start arm tracking/pop control (default false).
                                        Off so go_home keeps using
                                        scaled_joint_trajectory_controller; start
                                        the planner manually once parked.
@@ -132,23 +132,54 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'strike_height': ParameterValue(strike_height, value_type=float),
+            'ball_radius': 0.033,
+            # Calibrated with the ball resting on the paddle:
+            # ball_center - planner_paddle_point in base_link.
+            'ball_to_paddle_offset': [-0.082, 0.094, 0.116],
+            # Extra clearance so small perception/TF errors do not command the
+            # paddle into the ball before the upward follow-through.
+            'ball_to_paddle_offset_margin': [0.0, 0.0, 0.015],
+            'target_paddle_under_ball': True,
+            'stationary_start_enabled': True,
+            'stationary_start_speed_threshold': 0.08,
+            'stationary_start_position_tolerance': 0.025,
+            'stationary_start_cooldown': 1.0,
+            'publish_only_when_descending': True,
+            'descending_velocity_threshold': -0.05,
             'min_samples': 4,
             'buffer_size': 12,
         }],
     )
 
-    strike_planner_node = Node(
+    horizontal_pop_tracker_node = Node(
         package='roboball_planning',
-        executable='strike_planner',
-        name='strike_planner',
+        executable='horizontal_pop_tracker',
+        name='horizontal_pop_tracker',
         output='screen',
         parameters=[{
-            'num_waypoints': 2,
-            'ik_budget': 0.08,
-            'ik_timeout': 0.15,
-            'paddle_contact_offset_xyz': [-0.094, -0.057, 0.145],
-            'publish_debug_markers': True,
-            'debug_marker_frame': 'base_link',
+            'lock_contact_height': True,
+            'control_period': 0.05,
+            'min_body_clearance_radius': 0.30,
+            'pop_trigger_clearance': 0.254,
+            'pop_height': 0.1524,
+            'max_vertical_rise': 0.1524,
+            'pop_hold_duration': 0.10,
+            'recovery_duration': 0.20,
+            'pop_rearm_hysteresis': 0.02,
+            'min_pop_interval': 0.45,
+            'descending_velocity_threshold': -0.05,
+            'ball_timeout': 0.35,
+            'ik_timeout': 0.06,
+            'max_joint_speed': 1.0,
+            'max_ik_joint_delta': 0.785,
+            'ee_frame': 'tool0',
+            'ik_link_name': 'tool0',
+            # 7 inches from the tool0 origin to the paddle contact point.
+            # Adjust axis/sign if the physical paddle points along a different
+            # tool0-frame direction.
+            'paddle_offset_tool0': [0.0, 0.0, 0.1778],
+            'ball_to_paddle_offset': [-0.082, 0.094, 0.116],
+            'ball_to_paddle_offset_margin': [0.0, 0.0, 0.0],
         }],
         condition=IfCondition(start_strike_planner),
     )
@@ -173,6 +204,6 @@ def generate_launch_description():
         validator_node,
         ball_detector_node,
         predictor_node,
-        strike_planner_node,
-        shutdown_on_any_exit,
+        horizontal_pop_tracker_node,
+        # shutdown_on_any_exit,  # disabled during debugging — re-enable for demo
     ])

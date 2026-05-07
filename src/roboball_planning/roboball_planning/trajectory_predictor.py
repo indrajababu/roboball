@@ -24,6 +24,9 @@ from roboball_msgs.msg import BallState, StrikeTarget
 
 
 GRAVITY = 9.81  # m/s^2, +z up in base_link
+DEFAULT_BALL_RADIUS = 0.033
+DEFAULT_BALL_TO_PADDLE_OFFSET = [-0.082, 0.094, 0.116]
+DEFAULT_BALL_TO_PADDLE_OFFSET_MARGIN = [0.0, 0.0, 0.015]
 
 
 class TrajectoryPredictor(Node):
@@ -33,6 +36,44 @@ class TrajectoryPredictor(Node):
         self.buffer_size = int(self.declare_parameter('buffer_size', 12).value)
         self.min_samples = int(self.declare_parameter('min_samples', 4).value)
         self.strike_height = float(self.declare_parameter('strike_height', 0.60).value)
+        self.ball_radius = float(self.declare_parameter('ball_radius', DEFAULT_BALL_RADIUS).value)
+        self.ball_to_paddle_offset = np.array(
+            self.declare_parameter(
+                'ball_to_paddle_offset',
+                DEFAULT_BALL_TO_PADDLE_OFFSET,
+            ).value,
+            dtype=np.float64,
+        )
+        self.ball_to_paddle_offset_margin = np.array(
+            self.declare_parameter(
+                'ball_to_paddle_offset_margin',
+                DEFAULT_BALL_TO_PADDLE_OFFSET_MARGIN,
+            ).value,
+            dtype=np.float64,
+        )
+        self.target_paddle_under_ball = bool(
+            self.declare_parameter('target_paddle_under_ball', True).value
+        )
+        self.stationary_start_enabled = bool(
+            self.declare_parameter('stationary_start_enabled', True).value
+        )
+        self.stationary_start_speed_threshold = float(
+            self.declare_parameter('stationary_start_speed_threshold', 0.08).value
+        )
+        self.stationary_start_position_tolerance = float(
+            self.declare_parameter('stationary_start_position_tolerance', 0.025).value
+        )
+        self.stationary_start_cooldown = float(
+            self.declare_parameter('stationary_start_cooldown', 1.0).value
+        )
+        self._last_stationary_start_pub_time = -1e9
+        self._stationary_start_armed = True
+        self.publish_only_when_descending = bool(
+            self.declare_parameter('publish_only_when_descending', True).value
+        )
+        self.descending_velocity_threshold = float(
+            self.declare_parameter('descending_velocity_threshold', -0.05).value
+        )
 
         self.samples: "deque[tuple[float, np.ndarray]]" = deque(maxlen=self.buffer_size)
 
@@ -44,7 +85,18 @@ class TrajectoryPredictor(Node):
 
         self.get_logger().info(
             f'Trajectory predictor up. buffer_size={self.buffer_size}, '
-            f'min_samples={self.min_samples}, strike_height={self.strike_height} m'
+            f'min_samples={self.min_samples}, strike_height={self.strike_height} m, '
+            f'ball_radius={self.ball_radius} m, '
+            f'ball_to_paddle_offset={self.ball_to_paddle_offset.tolist()}, '
+            f'ball_to_paddle_offset_margin={self.ball_to_paddle_offset_margin.tolist()}, '
+            f'target_paddle_under_ball={self.target_paddle_under_ball}, '
+            f'stationary_start_enabled={self.stationary_start_enabled}, '
+            f'stationary_start_speed_threshold={self.stationary_start_speed_threshold} m/s, '
+            f'stationary_start_position_tolerance={self.stationary_start_position_tolerance} m, '
+            f'stationary_start_cooldown={self.stationary_start_cooldown} s, '
+            f'stationary_start_armed={self._stationary_start_armed}, '
+            f'publish_only_when_descending={self.publish_only_when_descending}, '
+            f'descending_velocity_threshold={self.descending_velocity_threshold} m/s'
         )
 
     def ball_callback(self, msg: PointStamped):
@@ -68,16 +120,102 @@ class TrajectoryPredictor(Node):
         state.fit_valid = True
         self.state_pub.publish(state)
 
+        stationary, raw_speed, raw_spread = self._stationary_start_status()
+        if stationary:
+            print("stationary!")
+            self._last_stationary_start_pub_time = self._now_sec()
+            self._stationary_start_armed = False
+            self._publish_target(
+                msg.header,
+                ball_center_xyz=pos_now,
+                time_to_impact=0.0,
+                vel_at_impact=np.zeros(3, dtype=np.float64),
+                reason=f'stationary_start raw_speed={raw_speed:.3f} raw_spread={raw_spread:.3f}',
+            )
+            return
+
         if t_impact is None:
             return
 
+        if (
+            self.publish_only_when_descending
+            and vel_now[2] > self.descending_velocity_threshold
+        ):
+            self.get_logger().debug(
+                f'Suppressing strike target while ball is not descending fast enough: '
+                f'vz={vel_now[2]:.3f} m/s threshold={self.descending_velocity_threshold:.3f}',
+                throttle_duration_sec=0.5,
+            )
+            return
+
+        self._publish_target(
+            msg.header,
+            ball_center_xyz=impact_xyz,
+            time_to_impact=t_impact,
+            vel_at_impact=vel_impact,
+            reason='ballistic',
+        )
+
+    def _stationary_start_status(self):
+        if not self.stationary_start_enabled:
+            return False, float('inf'), float('inf')
+        raw_speed, raw_spread = self._raw_motion_summary()
+        if raw_speed > self.stationary_start_speed_threshold:
+            if not self._stationary_start_armed:
+                self.get_logger().info(
+                    f'Stationary start re-armed: raw_speed={raw_speed:.3f} m/s.',
+                    throttle_duration_sec=1.0,
+                )
+            self._stationary_start_armed = True
+            return False, raw_speed, raw_spread
+        if raw_spread > self.stationary_start_position_tolerance:
+            if not self._stationary_start_armed:
+                self.get_logger().info(
+                    f'Stationary start re-armed: raw_spread={raw_spread:.3f} m.',
+                    throttle_duration_sec=1.0,
+                )
+            self._stationary_start_armed = True
+            return False, raw_speed, raw_spread
+        if not self._stationary_start_armed:
+            return False, raw_speed, raw_spread
+        if (
+            self._now_sec() - self._last_stationary_start_pub_time
+            < self.stationary_start_cooldown
+        ):
+            return False, raw_speed, raw_spread
+        return True, raw_speed, raw_spread
+
+    def _raw_motion_summary(self):
+        if len(self.samples) < 2:
+            return float('inf'), float('inf')
+        t_first, p_first = self.samples[0]
+        t_last, p_last = self.samples[-1]
+        dt = max(1e-6, float(t_last - t_first))
+        raw_speed = float(np.linalg.norm(p_last - p_first) / dt)
+        pts = np.vstack([p for _, p in self.samples])
+        center = np.mean(pts, axis=0)
+        raw_spread = float(np.max(np.linalg.norm(pts - center, axis=1)))
+        return raw_speed, raw_spread
+
+    def _should_publish_stationary_start(self, vel_now):
+        # Stationary detection uses raw recent samples because ballistic gravity
+        # compensation creates a fake velocity for a ball resting on the paddle.
+        stationary, _, _ = self._stationary_start_status()
+        return stationary
+
+    def _publish_target(self, source_header, ball_center_xyz, time_to_impact, vel_at_impact,
+                        reason=''):
         target = StrikeTarget()
-        # Keep the sensor stamp: downstream planning subtracts this age from
-        # time_to_impact so camera/perception latency does not get hidden.
-        target.header = msg.header
-        target.impact_pose.position.x = float(impact_xyz[0])
-        target.impact_pose.position.y = float(impact_xyz[1])
-        target.impact_pose.position.z = float(impact_xyz[2])
+        target.header.frame_id = source_header.frame_id
+        target.header.stamp = self.get_clock().now().to_msg()
+        paddle_xyz = np.array(ball_center_xyz, dtype=np.float64)
+        if self.target_paddle_under_ball:
+            paddle_xyz -= (
+                self.ball_to_paddle_offset + self.ball_to_paddle_offset_margin
+            )
+        target.impact_pose.position.x = float(paddle_xyz[0])
+        target.impact_pose.position.y = float(paddle_xyz[1])
+        target.impact_pose.position.z = float(paddle_xyz[2])
         # Paddle is mounted on the side of tool0; the wrist orientation that
         # leaves the paddle face pointing ~up in base_link is the home pose
         # captured below (measured via `tf2_echo base_link tool0`). Holding the
@@ -88,12 +226,21 @@ class TrajectoryPredictor(Node):
         target.impact_pose.orientation.z = 0.0
         target.impact_pose.orientation.w = 0.715
 
-        ttl = max(0.0, t_impact)
+        ttl = max(0.0, float(time_to_impact))
         target.time_to_impact = Duration(sec=int(ttl), nanosec=int((ttl % 1.0) * 1e9))
-        target.ball_velocity_at_impact.x = float(vel_impact[0])
-        target.ball_velocity_at_impact.y = float(vel_impact[1])
-        target.ball_velocity_at_impact.z = float(vel_impact[2])
+        target.ball_velocity_at_impact.x = float(vel_at_impact[0])
+        target.ball_velocity_at_impact.y = float(vel_at_impact[1])
+        target.ball_velocity_at_impact.z = float(vel_at_impact[2])
         self.target_pub.publish(target)
+        self.get_logger().info(
+            f'Published strike target ({reason}): '
+            f'ball_center={np.array(ball_center_xyz, dtype=np.float64).tolist()} '
+            f'paddle={paddle_xyz.tolist()} tti={ttl:.3f}s',
+            throttle_duration_sec=0.5,
+        )
+
+    def _now_sec(self):
+        return self.get_clock().now().nanoseconds * 1e-9
 
     def _fit_ballistic(self):
         """

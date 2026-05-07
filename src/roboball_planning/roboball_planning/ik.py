@@ -46,6 +46,7 @@ class IKPlanner(Node):
     # -----------------------------------------------------------
     def compute_ik(self, current_joint_state, x, y, z,
                    qx=0.0, qy=1.0, qz=0.0, qw=0.0,
+                   ik_link_name='tool0',
                    timeout_sec=0.25): # Think about why the default quaternion is like this. Why is qy=1?
         pose = PoseStamped()
         pose.header.frame_id = 'base_link'
@@ -59,7 +60,7 @@ class IKPlanner(Node):
 
         ik_req = GetPositionIK.Request()
         ik_req.ik_request.pose_stamped = pose
-        ik_req.ik_request.ik_link_name = 'wrist_3_link'
+        ik_req.ik_request.ik_link_name = ik_link_name
         ik_req.ik_request.robot_state.joint_state = current_joint_state
         ik_req.ik_request.avoid_collisions = True
         ik_req.ik_request.timeout = Duration(

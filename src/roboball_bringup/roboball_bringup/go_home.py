@@ -1,10 +1,18 @@
+#!/usr/bin/env python3
 """
-Go-to-home — adapted from lab3_ur7e/joint_control/joint_pos_controller.py.
+Go-to-home for UR7e.
 
-Publishes a single JointTrajectory point via the validator topic so the
-TrajectoryValidator (lab3_ur7e) bound-checks before forwarding to the UR
-controller. Run this at the start of every session to park the arm at a
-known-good pose before doing anything else.
+Publishes a single JointTrajectory point to /joint_trajectory_validated.
+This does NOT use IK. It directly commands a known-good joint-space pose.
+
+This version uses the joint ordering observed from your validator / echo:
+
+  shoulder_lift_joint
+  elbow_joint
+  wrist_1_joint
+  wrist_2_joint
+  wrist_3_joint
+  shoulder_pan_joint
 
 Usage:
   ros2 run roboball_bringup go_home
@@ -17,30 +25,61 @@ from rclpy.node import Node
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
-# Same safe home used in lab3_ur7e/validate_trajectory.py (validator's
-# self.valid_joint_positions). Joint-name ordering matches that validator.
+# Joint order matches your validator / observed trajectory message.
 HOME_JOINT_NAMES = [
-    'shoulder_lift_joint',
-    'elbow_joint',
-    'wrist_1_joint',
-    'wrist_2_joint',
-    'wrist_3_joint',
-    'shoulder_pan_joint',
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+    "shoulder_pan_joint",
 ]
-HOME_POSITIONS = [-1.7394, -2.4058, 1.0243, 1.5489, -4.8575, 3.1717]
+
+# Home pose copied from the known-good joint-space state you pasted.
+# This is NOT an IK target. These are direct joint angles in radians.
+HOME_POSITIONS = [
+    -2.316411157647604,   # shoulder_lift_joint
+    -1.810107946395874,   # elbow_joint
+    1.0502943235584716,   # wrist_1_joint
+    2.0732617378234863,   # wrist_2_joint
+    -1.5386202971087855,  # wrist_3_joint
+    5.799105644226074,    # shoulder_pan_joint
+]
 
 
 class GoHome(Node):
     def __init__(self):
-        super().__init__('go_home')
-        self.pub = self.create_publisher(JointTrajectory, '/joint_trajectory_validated', 10)
+        super().__init__("go_home")
+
+        self.pub = self.create_publisher(
+            JointTrajectory,
+            "/joint_trajectory_validated",
+            10,
+        )
+
+        self.get_logger().info("Waiting for subscriber on /joint_trajectory_validated...")
+
+        while rclpy.ok() and self.pub.get_subscription_count() == 0:
+            self.get_logger().info(
+                "No subscriber yet. Is validate_trajectory running?"
+            )
+            time.sleep(0.5)
+
+        # Wait for DDS to fully establish the connection before publishing.
+        time.sleep(0.5)
 
         traj = JointTrajectory()
-        traj.joint_names = HOME_JOINT_NAMES
+        traj.header.stamp = self.get_clock().now().to_msg()
+        traj.header.frame_id = "base_link"
+        traj.joint_names = list(HOME_JOINT_NAMES)
+
         point = JointTrajectoryPoint()
         point.positions = list(HOME_POSITIONS)
-        point.velocities = [0.0] * 6
-        point.time_from_start.sec = 5
+        point.velocities = [0.0] * len(HOME_POSITIONS)
+        point.accelerations = [0.0] * len(HOME_POSITIONS)
+        point.time_from_start.sec = 1
+        point.time_from_start.nanosec = 0
+
         traj.points.append(point)
 
         # Wait for the validate_trajectory subscriber to connect before publishing.
@@ -48,18 +87,26 @@ class GoHome(Node):
         while self.pub.get_subscription_count() == 0:
             time.sleep(0.1)
         self.pub.publish(traj)
-        self.get_logger().info(f'Published home target: {HOME_POSITIONS}')
+
+        self.get_logger().info("Published direct joint-space home trajectory.")
+        self.get_logger().info(f"joint_names={traj.joint_names}")
+        self.get_logger().info(f"positions={point.positions}")
+        self.get_logger().info("No IK was used.")
 
 
 def main(args=None):
     rclpy.init(args=args)
+
     node = GoHome()
-    rclpy.spin_once(node)
-    # Give DDS a moment to flush the message before the process exits.
-    time.sleep(1.0)
+
+    # Spin briefly so DDS has time to publish before shutdown.
+    end_time = time.time() + 1.0
+    while rclpy.ok() and time.time() < end_time:
+        rclpy.spin_once(node, timeout_sec=0.1)
+
     node.destroy_node()
     rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
