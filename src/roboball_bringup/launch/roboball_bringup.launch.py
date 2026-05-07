@@ -170,7 +170,7 @@ def generate_launch_description():
             'descending_velocity_threshold': -0.05,
             'ball_timeout': 0.35,
             'ik_timeout': 0.06,
-            'max_joint_speed': 1.0,
+            'max_joint_speed': 2.0,
             'max_ik_joint_delta': 0.785,
             'ee_frame': 'tool0',
             'ik_link_name': 'tool0',

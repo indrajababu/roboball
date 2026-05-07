@@ -48,7 +48,7 @@ class HorizontalPopTracker(Node):
         super().__init__('horizontal_pop_tracker')
         self._cb_group = ReentrantCallbackGroup()
 
-        self.control_period = float(self.declare_parameter('control_period', 0.05).value)
+        self.control_period = float(self.declare_parameter('control_period', 0.02).value)
         self.pop_height = min(
             float(self.declare_parameter('pop_height', 6.0 * INCH_TO_M).value),
             6.0 * INCH_TO_M,
@@ -58,7 +58,7 @@ class HorizontalPopTracker(Node):
             6.0 * INCH_TO_M,
         )
         self.pop_trigger_clearance = float(
-            self.declare_parameter('pop_trigger_clearance', 10.0 * INCH_TO_M).value
+            self.declare_parameter('pop_trigger_clearance', 15.0 * INCH_TO_M).value
         )
         self.pop_hold_duration = float(
             self.declare_parameter('pop_hold_duration', 0.10).value
@@ -121,7 +121,7 @@ class HorizontalPopTracker(Node):
             dtype=np.float64,
         )
 
-        Kp = 0.2 * np.array([2.0, 2.0, 1.7, 1.5, 2.0, 2.0])
+        Kp = 2 * np.array([2.0, 2.0, 1.7, 1.5, 2.0, 2.0])
         Kd = 0.01 * np.array([2.0, 1.0, 2.0, 0.5, 0.8, 0.8])
         Ki = 0.01 * np.array([1.4, 1.4, 1.4, 1.0, 0.6, 0.6])
         self.pid = PIDJointVelocityController(
