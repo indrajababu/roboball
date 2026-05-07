@@ -1,26 +1,12 @@
 #!/usr/bin/env python3
-"""Continuous horizontal ball tracker with one bounded vertical pop per cycle.
+"""Continuous horizontal ball tracker with one bounded vertical pop per cycle."""
 
-Adds lightweight runtime rate tracking for:
-  * /ball_pose observer rate
-  * /strike_target observer rate
-  * /ball_state control-input rate
-  * control timer execution rate
-  * IK attempt/success rate
-  * velocity publish rate
-
-The rate trackers are intentionally passive. The /ball_pose and /strike_target
-subscriptions only count messages and do not affect control behavior.
-"""
-
-from collections import deque
 import subprocess
 import threading
 import time
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PointStamped
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -29,10 +15,10 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from tf2_ros import Buffer, TransformException, TransformListener
 
-from roboball_msgs.msg import BallState, StrikeTarget
+from roboball_msgs.msg import BallState
 from roboball_planning.controller import PIDJointVelocityController
 from roboball_planning.ik import IKPlanner
-import tf_transformations 
+
 
 JOINT_ORDER = [
     'shoulder_pan_joint',
@@ -51,42 +37,6 @@ DEFAULT_PADDLE_OFFSET_TOOL0 = [0.0, 0.0, 7.0 * INCH_TO_M]
 DEFAULT_BALL_TO_PADDLE_OFFSET = [-0.082, 0.094, 0.116]
 
 
-class RateTracker:
-    """Sliding-window Hz tracker."""
-
-    def __init__(self, window_sec=2.0):
-        self.window_sec = float(window_sec)
-        self.times = deque()
-        self.total = 0
-
-    def tick(self, now=None):
-        now = time.monotonic() if now is None else float(now)
-        self.total += 1
-        self.times.append(now)
-        self._trim(now)
-
-    def rate_hz(self, now=None):
-        now = time.monotonic() if now is None else float(now)
-        self._trim(now)
-        if len(self.times) < 2:
-            return 0.0
-        elapsed = self.times[-1] - self.times[0]
-        if elapsed <= 1e-9:
-            return 0.0
-        return (len(self.times) - 1) / elapsed
-
-    def age_sec(self, now=None):
-        now = time.monotonic() if now is None else float(now)
-        if not self.times:
-            return None
-        return now - self.times[-1]
-
-    def _trim(self, now):
-        cutoff = now - self.window_sec
-        while self.times and self.times[0] < cutoff:
-            self.times.popleft()
-
-
 class HorizontalPopTracker(Node):
     """Track ball XY at a locked height, popping once when the ball gets close."""
 
@@ -98,29 +48,23 @@ class HorizontalPopTracker(Node):
         super().__init__('horizontal_pop_tracker')
         self._cb_group = ReentrantCallbackGroup()
 
-        self.control_period = float(self.declare_parameter('control_period', 0.05).value)
-        self.rate_log_period = float(
-            self.declare_parameter('rate_log_period', 1.0).value
-        )
-        self.rate_window_sec = float(
-            self.declare_parameter('rate_window_sec', 2.0).value
-        )
+        self.control_period = float(self.declare_parameter('control_period', 0.02).value)
         self.pop_height = min(
-            float(self.declare_parameter('pop_height', 6.0 * INCH_TO_M).value),
+            float(self.declare_parameter('pop_height', 9.0 * INCH_TO_M).value),
             6.0 * INCH_TO_M,
         )
         self.max_vertical_rise = min(
-            float(self.declare_parameter('max_vertical_rise', 6.0 * INCH_TO_M).value),
+            float(self.declare_parameter('max_vertical_rise', 9.0 * INCH_TO_M).value),
             6.0 * INCH_TO_M,
         )
         self.pop_trigger_clearance = float(
-            self.declare_parameter('pop_trigger_clearance', 10.0 * INCH_TO_M).value
+            self.declare_parameter('pop_trigger_clearance', 17.5 * INCH_TO_M).value
         )
         self.pop_hold_duration = float(
-            self.declare_parameter('pop_hold_duration', 0.10).value
+            self.declare_parameter('pop_hold_duration', 0.01).value
         )
         self.recovery_duration = float(
-            self.declare_parameter('recovery_duration', 0.20).value
+            self.declare_parameter('recovery_duration', 0.5).value
         )
         self.pop_rearm_hysteresis = float(
             self.declare_parameter('pop_rearm_hysteresis', 0.02).value
@@ -129,7 +73,7 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('lock_contact_height', True).value
         )
         self.min_pop_interval = float(
-            self.declare_parameter('min_pop_interval', 0.45).value
+            self.declare_parameter('min_pop_interval', 0.10).value
         )
         self.descending_velocity_threshold = float(
             self.declare_parameter('descending_velocity_threshold', -0.05).value
@@ -177,12 +121,20 @@ class HorizontalPopTracker(Node):
             dtype=np.float64,
         )
 
-        Kp = 0.2 * np.array([2.0, 2.0, 1.7, 1.5, 2.0, 2.0])
+        Kp = 2 * np.array([2.0, 2.0, 1.7, 1.5, 2.0, 2.0])
         Kd = 0.01 * np.array([2.0, 1.0, 2.0, 0.5, 0.8, 0.8])
         Ki = 0.01 * np.array([1.4, 1.4, 1.4, 1.0, 0.6, 0.6])
         self.pid = PIDJointVelocityController(
             self,
             Kp,
+            Ki,
+            Kd,
+            dt=self.control_period,
+            max_integral_error=0.5,
+        )
+        self.pid_vertical = PIDJointVelocityController(
+            self,
+            Kp * 5,
             Ki,
             Kd,
             dt=self.control_period,
@@ -208,16 +160,6 @@ class HorizontalPopTracker(Node):
         self._lock = threading.Lock()
         self._tick_lock = threading.Lock()
 
-        self.ball_pose_rate = RateTracker(self.rate_window_sec)
-        self.strike_target_rate = RateTracker(self.rate_window_sec)
-        self.ball_state_rate = RateTracker(self.rate_window_sec)
-        self.control_tick_rate = RateTracker(self.rate_window_sec)
-        self.ik_attempt_rate = RateTracker(self.rate_window_sec)
-        self.ik_success_rate = RateTracker(self.rate_window_sec)
-        self.velocity_publish_rate = RateTracker(self.rate_window_sec)
-        self._last_rate_log_time = 0.0
-        self._last_ik_ms = None
-
         self.create_subscription(
             JointState,
             '/joint_states',
@@ -229,20 +171,6 @@ class HorizontalPopTracker(Node):
             BallState,
             '/ball_state',
             self._on_ball_state,
-            10,
-            callback_group=self._cb_group,
-        )
-        self.create_subscription(
-            PointStamped,
-            '/ball_pose',
-            self._on_ball_pose_observed,
-            10,
-            callback_group=self._cb_group,
-        )
-        self.create_subscription(
-            StrikeTarget,
-            '/strike_target',
-            self._on_strike_target_observed,
             10,
             callback_group=self._cb_group,
         )
@@ -272,9 +200,7 @@ class HorizontalPopTracker(Node):
             f'contact_height={self.contact_height}, '
             f'min_body_clearance_radius={self.min_body_clearance_radius:.3f}m, '
             f'max_joint_speed={self.max_joint_speed:.3f}rad/s, '
-            f'max_ik_joint_delta={self.max_ik_joint_delta:.3f}rad, '
-            f'rate_window_sec={self.rate_window_sec:.2f}s, '
-            f'rate_log_period={self.rate_log_period:.2f}s. '
+            f'max_ik_joint_delta={self.max_ik_joint_delta:.3f}rad. '
             'Z target is fixed except during the bounded pop.'
         )
 
@@ -283,19 +209,9 @@ class HorizontalPopTracker(Node):
             self.joint_state = msg
 
     def _on_ball_state(self, msg):
-        now = time.monotonic()
-        self.ball_state_rate.tick(now)
         with self._lock:
             self.ball_state = msg
-            self.ball_rx_time = now
-
-    def _on_ball_pose_observed(self, msg):
-        self.ball_pose_rate.tick()
-
-    def _on_strike_target_observed(self, msg):
-        with self._lock:
-            self.strike_target = msg
-        self.strike_target_rate.tick()
+            self.ball_rx_time = time.monotonic()
 
     def _control_tick(self):
         if not self._tick_lock.acquire(blocking=False):
@@ -309,14 +225,10 @@ class HorizontalPopTracker(Node):
         with self._lock:
             joint_state = self.joint_state
             ball_state = self.ball_state
-            # TODO strike_target = self.strike_target
             ball_rx_time = self.ball_rx_time
 
         if joint_state is None:
-            self._maybe_log_rates()
             return
-
-        self.control_tick_rate.tick()
 
         try:
             tf = self.tf_buffer.lookup_transform(BASE_FRAME, self.ee_frame, Time())
@@ -326,7 +238,6 @@ class HorizontalPopTracker(Node):
                 throttle_duration_sec=1.0,
             )
             self._publish_velocity(np.zeros(6))
-            self._maybe_log_rates()
             return
 
         tool_xyz = np.array([
@@ -396,31 +307,13 @@ class HorizontalPopTracker(Node):
             target_xy[1],
             target_z,
         ], dtype=np.float64)
-<<<<<<< HEAD
-        
-=======
-
->>>>>>> fedebeca246a58379de8510874c6a535c642d9bf
-        desired_tool_quat = _outward_tool_quat_from_xy(
-            target_paddle_xyz[:2],
-            fallback_quat=self._locked_tool_quat,
-        )
-
         tool_target_xyz = _paddle_to_tool_xyz(
             target_paddle_xyz,
-            desired_tool_quat,
+            self._locked_tool_quat,
             self.paddle_offset_tool0,
         )
-<<<<<<< HEAD
+        qx, qy, qz, qw = self._locked_tool_quat
 
-        qx, qy, qz, qw = desired_tool_quat
-=======
->>>>>>> fedebeca246a58379de8510874c6a535c642d9bf
-
-        qx, qy, qz, qw = desired_tool_quat
-
-        self.ik_attempt_rate.tick()
-        ik_start = time.monotonic()
         ik_solution = self.ik_planner.compute_ik(
             joint_state,
             tool_target_xyz[0],
@@ -433,15 +326,9 @@ class HorizontalPopTracker(Node):
             ik_link_name=self.ik_link_name,
             timeout_sec=self.ik_timeout,
         )
-        ik_elapsed = time.monotonic() - ik_start
-        self._last_ik_ms = ik_elapsed * 1000.0
-
         if ik_solution is None:
             self._publish_velocity(np.zeros(6))
-            self._maybe_log_rates()
             return
-
-        self.ik_success_rate.tick()
 
         current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
         target_pos = _reorder_positions(ik_solution, JOINT_ORDER)
@@ -453,16 +340,15 @@ class HorizontalPopTracker(Node):
                 f'> limit={self.max_ik_joint_delta:.3f}rad.',
                 throttle_duration_sec=1.0,
             )
-            self.pid.integral_error = np.zeros(6)
+            self._reset_pid_integrators()
             self._publish_velocity(np.zeros(6))
-            self._maybe_log_rates()
             return
         target_pos = current_pos + target_delta
-        target_vel = np.zeros(6)
-        cmd = self.pid.step_control(target_pos, target_vel, current_pos, current_vel)
+        target_vel = np.zeros(6)        
+        active_pid = self.pid_vertical if self._state in (self.POP, self.RECOVER) else self.pid
+        cmd = active_pid.step_control(target_pos, target_vel, current_pos, current_vel)
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
         self._publish_velocity(cmd)
-        self._maybe_log_rates()
 
     def _update_pop_state(self, now_mono, ball_pos):
         ball_clearance = float(ball_pos[2] - self._nominal_paddle_z)
@@ -482,7 +368,7 @@ class HorizontalPopTracker(Node):
                 self._pop_start_time = now_mono
                 self._pop_armed = False
                 self._last_pop_time = now_mono
-                self.pid.integral_error = np.zeros(6)
+                self._reset_pid_integrators()
                 self.get_logger().info(
                     f'POP start: ball_clearance={ball_clearance:.3f}m, '
                     f'target_z={self._nominal_paddle_z + self.pop_height:.3f}m.'
@@ -493,7 +379,7 @@ class HorizontalPopTracker(Node):
             if now_mono - self._pop_start_time >= self.pop_hold_duration:
                 self._state = self.RECOVER
                 self._recover_start_time = now_mono
-                self.pid.integral_error = np.zeros(6)
+                self._reset_pid_integrators()
                 self.get_logger().info('POP complete; recovering to locked height.')
             return
 
@@ -501,21 +387,26 @@ class HorizontalPopTracker(Node):
             if now_mono - self._recover_start_time >= self.recovery_duration:
                 self._state = self.TRACK
                 self._recover_start_time = None
-                self.pid.integral_error = np.zeros(6)
+                self._reset_pid_integrators()
                 self.get_logger().info('Recovery complete; tracking XY at locked height.')
 
     def _finish_pop_state_without_ball(self, now_mono):
         if self._state == self.POP and now_mono - self._pop_start_time >= self.pop_hold_duration:
             self._state = self.RECOVER
             self._recover_start_time = now_mono
-            self.pid.integral_error = np.zeros(6)
+            self._reset_pid_integrators()
         elif (
             self._state == self.RECOVER
             and now_mono - self._recover_start_time >= self.recovery_duration
         ):
             self._state = self.TRACK
             self._recover_start_time = None
-            self.pid.integral_error = np.zeros(6)
+            self._reset_pid_integrators()
+
+    def _reset_pid_integrators(self):
+        self.pid.integral_error = np.zeros(6)
+        self.pid_vertical.integral_error = np.zeros(6)
+
 
     def _enforce_vertical_ceiling(self, now_mono, current_paddle_z):
         ceiling_z = self._nominal_paddle_z + self.max_vertical_rise
@@ -534,7 +425,7 @@ class HorizontalPopTracker(Node):
         if self._state != self.RECOVER:
             self._state = self.RECOVER
             self._recover_start_time = now_mono
-            self.pid.integral_error = np.zeros(6)
+            self._reset_pid_integrators()
         return True
 
     def _target_paddle_z(self, now_mono, over_ceiling=False):
@@ -547,39 +438,7 @@ class HorizontalPopTracker(Node):
             )
         return self._nominal_paddle_z
 
-    def _maybe_log_rates(self):
-        now = time.monotonic()
-        if now - self._last_rate_log_time < self.rate_log_period:
-            return
-        self._last_rate_log_time = now
-
-        def fmt_age(age):
-            return 'none' if age is None else f'{age:.3f}s'
-
-        last_ik = (
-            'none'
-            if self._last_ik_ms is None
-            else f'{self._last_ik_ms:.1f}ms'
-        )
-
-        self.get_logger().info(
-            'rates: '
-            f'ball_pose={self.ball_pose_rate.rate_hz(now):.1f}Hz '
-            f'(age={fmt_age(self.ball_pose_rate.age_sec(now))}), '
-            f'strike_target={self.strike_target_rate.rate_hz(now):.1f}Hz '
-            f'(age={fmt_age(self.strike_target_rate.age_sec(now))}), '
-            f'ball_state={self.ball_state_rate.rate_hz(now):.1f}Hz '
-            f'(age={fmt_age(self.ball_state_rate.age_sec(now))}), '
-            f'control_tick={self.control_tick_rate.rate_hz(now):.1f}Hz, '
-            f'ik_attempt={self.ik_attempt_rate.rate_hz(now):.1f}Hz, '
-            f'ik_success={self.ik_success_rate.rate_hz(now):.1f}Hz, '
-            f'vel_pub={self.velocity_publish_rate.rate_hz(now):.1f}Hz, '
-            f'last_ik={last_ik}, '
-            f'state={self._state}'
-        )
-
     def _publish_velocity(self, cmd):
-        self.velocity_publish_rate.tick()
         msg = Float64MultiArray()
         msg.data = list(map(float, cmd))
         self.velocity_pub.publish(msg)
@@ -671,36 +530,6 @@ def _quat_to_rot(x, y, z, w):
         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
     ], dtype=np.float64)
 
-def _outward_tool_quat_from_xy(xy, fallback_quat=None):
-    xy = np.asarray(xy, dtype=np.float64)
-    radial = np.array([xy[0], xy[1], 0.0], dtype=np.float64)
-    radial_norm = float(np.linalg.norm(radial))
-
-    if radial_norm < 1e-6:
-        if fallback_quat is not None:
-            return fallback_quat
-        return (0.0, 0.0, 0.0, 1.0)
-
-    z_axis = radial / radial_norm
-
-    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-
-    x_axis = np.cross(world_up, z_axis)
-    x_norm = float(np.linalg.norm(x_axis))
-    if x_norm < 1e-6:
-        if fallback_quat is not None:
-            return fallback_quat
-        return (0.0, 0.0, 0.0, 1.0)
-    x_axis = x_axis / x_norm
-
-    y_axis = np.cross(z_axis, x_axis)
-    y_axis = y_axis / max(1e-9, float(np.linalg.norm(y_axis)))
-
-    rot = np.column_stack([x_axis, y_axis, z_axis])
-
-    rot44 = tf_transformations.identity_matrix()
-    rot44[0:3, 0:3] = rot
-    return tf_transformations.quaternion_from_matrix(rot44)
 
 def main(args=None):
     rclpy.init(args=args)
