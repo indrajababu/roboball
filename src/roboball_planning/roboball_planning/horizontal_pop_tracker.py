@@ -78,6 +78,16 @@ class HorizontalPopTracker(Node):
         self.descending_velocity_threshold = float(
             self.declare_parameter('descending_velocity_threshold', -0.05).value
         )
+        self.hit_velocity_gain = float(
+            self.declare_parameter('hit_velocity_gain', 1.2).value
+        )
+        self.min_hit_velocity = float(
+            self.declare_parameter('min_hit_velocity', 0.15).value
+        )
+        self.max_hit_velocity = float(
+            self.declare_parameter('max_hit_velocity', 0.80).value
+        )
+        self._pop_paddle_velocity = 0.0
         configured_contact_height = float(
             self.declare_parameter('contact_height', float('nan')).value
         )
@@ -287,6 +297,11 @@ class HorizontalPopTracker(Node):
                 ball_state.position.y,
                 ball_state.position.z,
             ], dtype=np.float64)
+            ball_vel = np.array([
+                ball_state.velocity.x,
+                ball_state.velocity.y,
+                ball_state.velocity.z,
+            ], dtype=np.float64)
             target_xy = (
                 ball_pos[:2]
                 - self.ball_to_paddle_offset[:2]
@@ -297,11 +312,15 @@ class HorizontalPopTracker(Node):
                 self.min_body_clearance_radius,
             )
             self._last_target_xy = target_xy.copy()
-            self._update_pop_state(now_mono, ball_pos)
+            self._update_pop_state(now_mono, ball_pos, ball_vel)
         else:
             self._finish_pop_state_without_ball(now_mono)
 
-        target_z = self._target_paddle_z(now_mono, over_ceiling=over_ceiling)
+        target_z = self._target_paddle_z(
+            now_mono,
+            current_paddle_z=float(current_paddle_xyz[2]),
+            over_ceiling=over_ceiling,
+        )
         target_paddle_xyz = np.array([
             target_xy[0],
             target_xy[1],
@@ -350,8 +369,10 @@ class HorizontalPopTracker(Node):
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
         self._publish_velocity(cmd)
 
-    def _update_pop_state(self, now_mono, ball_pos):
+    def _update_pop_state(self, now_mono, ball_pos, ball_vel):
+        ball_vel_z = float(ball_vel[2])
         ball_clearance = float(ball_pos[2] - self._nominal_paddle_z)
+        
         if not self._pop_armed:
             rearm_clearance = self.pop_trigger_clearance + self.pop_rearm_hysteresis
             if ball_clearance >= rearm_clearance:
@@ -361,9 +382,19 @@ class HorizontalPopTracker(Node):
                 )
 
         if self._state == self.TRACK:
+            #Let's change this so that we trigger by speed
+
             ready_by_height = ball_clearance <= self.pop_trigger_clearance
+            ready_by_velocity = ball_vel_z <= self.descending_velocity_threshold
             ready_by_time = now_mono - self._last_pop_time >= self.min_pop_interval
-            if self._pop_armed and ready_by_height and ready_by_time:
+
+            if self._pop_armed and ready_by_height and ready_by_velocity and ready_by_time:
+                incoming_speed = max(0.0, -ball_vel_z)
+                self._pop_paddle_velocity = float(np.clip(
+                    self.hit_velocity_gain * incoming_speed,
+                    self.min_hit_velocity,
+                    self.max_hit_velocity,
+                ))
                 self._state = self.POP
                 self._pop_start_time = now_mono
                 self._pop_armed = False
@@ -371,7 +402,8 @@ class HorizontalPopTracker(Node):
                 self._reset_pid_integrators()
                 self.get_logger().info(
                     f'POP start: ball_clearance={ball_clearance:.3f}m, '
-                    f'target_z={self._nominal_paddle_z + self.pop_height:.3f}m.'
+                    f'ball_vel_z={ball_vel_z:.3f}m/s, '
+                    f'pop_paddle_velocity={self._pop_paddle_velocity:.3f}m/s.'
                 )
             return
 
@@ -428,14 +460,18 @@ class HorizontalPopTracker(Node):
             self._reset_pid_integrators()
         return True
 
-    def _target_paddle_z(self, now_mono, over_ceiling=False):
+    def _target_paddle_z(self, now_mono, current_paddle_z, over_ceiling=False):
         if over_ceiling:
             return self._nominal_paddle_z
+
+        ceiling_z = self._nominal_paddle_z + self.max_vertical_rise
+
         if self._state == self.POP:
             return min(
-                self._nominal_paddle_z + self.pop_height,
-                self._nominal_paddle_z + self.max_vertical_rise,
+                current_paddle_z + self._pop_paddle_velocity * self.control_period,
+                ceiling_z,
             )
+
         return self._nominal_paddle_z
 
     def _publish_velocity(self, cmd):
