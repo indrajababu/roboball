@@ -32,6 +32,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from roboball_msgs.msg import BallState, StrikeTarget
 from roboball_planning.controller import PIDJointVelocityController
 from roboball_planning.ik import IKPlanner
+import tf_transformations
 
 
 JOINT_ORDER = [
@@ -396,12 +397,19 @@ class HorizontalPopTracker(Node):
             target_xy[1],
             target_z,
         ], dtype=np.float64)
+
+        desired_tool_quat = _outward_tool_quat_from_xy(
+            target_paddle_xyz[:2],
+            fallback_quat=self._locked_tool_quat,
+        )
+
         tool_target_xyz = _paddle_to_tool_xyz(
             target_paddle_xyz,
-            self._locked_tool_quat,
+            desired_tool_quat,
             self.paddle_offset_tool0,
         )
-        qx, qy, qz, qw = self._locked_tool_quat
+
+        qx, qy, qz, qw = desired_tool_quat
 
         self.ik_attempt_rate.tick()
         ik_start = time.monotonic()
@@ -655,6 +663,36 @@ def _quat_to_rot(x, y, z, w):
         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
     ], dtype=np.float64)
 
+def _outward_tool_quat_from_xy(xy, fallback_quat=None):
+    xy = np.asarray(xy, dtype=np.float64)
+    radial = np.array([xy[0], xy[1], 0.0], dtype=np.float64)
+    radial_norm = float(np.linalg.norm(radial))
+
+    if radial_norm < 1e-6:
+        if fallback_quat is not None:
+            return fallback_quat
+        return (0.0, 0.0, 0.0, 1.0)
+
+    z_axis = radial / radial_norm
+
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    x_axis = np.cross(world_up, z_axis)
+    x_norm = float(np.linalg.norm(x_axis))
+    if x_norm < 1e-6:
+        if fallback_quat is not None:
+            return fallback_quat
+        return (0.0, 0.0, 0.0, 1.0)
+    x_axis = x_axis / x_norm
+
+    y_axis = np.cross(z_axis, x_axis)
+    y_axis = y_axis / max(1e-9, float(np.linalg.norm(y_axis)))
+
+    rot = np.column_stack([x_axis, y_axis, z_axis])
+
+    rot44 = tf_transformations.identity_matrix()
+    rot44[0:3, 0:3] = rot
+    return tf_transformations.quaternion_from_matrix(rot44)
 
 def main(args=None):
     rclpy.init(args=args)
