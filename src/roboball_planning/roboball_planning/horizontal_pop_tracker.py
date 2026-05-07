@@ -58,13 +58,13 @@ class HorizontalPopTracker(Node):
             6.0 * INCH_TO_M,
         )
         self.pop_trigger_clearance = float(
-            self.declare_parameter('pop_trigger_clearance', 15.0 * INCH_TO_M).value
+            self.declare_parameter('pop_trigger_clearance', 17.5 * INCH_TO_M).value
         )
         self.pop_hold_duration = float(
-            self.declare_parameter('pop_hold_duration', 0.10).value
+            self.declare_parameter('pop_hold_duration', 0.03).value
         )
         self.recovery_duration = float(
-            self.declare_parameter('recovery_duration', 0.20).value
+            self.declare_parameter('recovery_duration', 0.7).value
         )
         self.pop_rearm_hysteresis = float(
             self.declare_parameter('pop_rearm_hysteresis', 0.02).value
@@ -73,7 +73,7 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('lock_contact_height', True).value
         )
         self.min_pop_interval = float(
-            self.declare_parameter('min_pop_interval', 0.45).value
+            self.declare_parameter('min_pop_interval', 0.15).value
         )
         self.descending_velocity_threshold = float(
             self.declare_parameter('descending_velocity_threshold', -0.05).value
@@ -127,6 +127,14 @@ class HorizontalPopTracker(Node):
         self.pid = PIDJointVelocityController(
             self,
             Kp,
+            Ki,
+            Kd,
+            dt=self.control_period,
+            max_integral_error=0.5,
+        )
+        self.pid_vertical = PIDJointVelocityController(
+            self,
+            Kp * 5,
             Ki,
             Kd,
             dt=self.control_period,
@@ -332,12 +340,13 @@ class HorizontalPopTracker(Node):
                 f'> limit={self.max_ik_joint_delta:.3f}rad.',
                 throttle_duration_sec=1.0,
             )
-            self.pid.integral_error = np.zeros(6)
+            self._reset_pid_integrators()
             self._publish_velocity(np.zeros(6))
             return
         target_pos = current_pos + target_delta
-        target_vel = np.zeros(6)
-        cmd = self.pid.step_control(target_pos, target_vel, current_pos, current_vel)
+        target_vel = np.zeros(6)        
+        active_pid = self.pid_vertical if self._state in (self.POP, self.RECOVER) else self.pid
+        cmd = active_pid.step_control(target_pos, target_vel, current_pos, current_vel)
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
         self._publish_velocity(cmd)
 
@@ -359,7 +368,7 @@ class HorizontalPopTracker(Node):
                 self._pop_start_time = now_mono
                 self._pop_armed = False
                 self._last_pop_time = now_mono
-                self.pid.integral_error = np.zeros(6)
+                self._reset_pid_integrators()
                 self.get_logger().info(
                     f'POP start: ball_clearance={ball_clearance:.3f}m, '
                     f'target_z={self._nominal_paddle_z + self.pop_height:.3f}m.'
@@ -370,7 +379,7 @@ class HorizontalPopTracker(Node):
             if now_mono - self._pop_start_time >= self.pop_hold_duration:
                 self._state = self.RECOVER
                 self._recover_start_time = now_mono
-                self.pid.integral_error = np.zeros(6)
+                self._reset_pid_integrators()
                 self.get_logger().info('POP complete; recovering to locked height.')
             return
 
@@ -378,21 +387,26 @@ class HorizontalPopTracker(Node):
             if now_mono - self._recover_start_time >= self.recovery_duration:
                 self._state = self.TRACK
                 self._recover_start_time = None
-                self.pid.integral_error = np.zeros(6)
+                self._reset_pid_integrators()
                 self.get_logger().info('Recovery complete; tracking XY at locked height.')
 
     def _finish_pop_state_without_ball(self, now_mono):
         if self._state == self.POP and now_mono - self._pop_start_time >= self.pop_hold_duration:
             self._state = self.RECOVER
             self._recover_start_time = now_mono
-            self.pid.integral_error = np.zeros(6)
+            self._reset_pid_integrators()
         elif (
             self._state == self.RECOVER
             and now_mono - self._recover_start_time >= self.recovery_duration
         ):
             self._state = self.TRACK
             self._recover_start_time = None
-            self.pid.integral_error = np.zeros(6)
+            self._reset_pid_integrators()
+
+    def _reset_pid_integrators(self):
+        self.pid.integral_error = np.zeros(6)
+        self.pid_vertical.integral_error = np.zeros(6)
+
 
     def _enforce_vertical_ceiling(self, now_mono, current_paddle_z):
         ceiling_z = self._nominal_paddle_z + self.max_vertical_rise
@@ -411,7 +425,7 @@ class HorizontalPopTracker(Node):
         if self._state != self.RECOVER:
             self._state = self.RECOVER
             self._recover_start_time = now_mono
-            self.pid.integral_error = np.zeros(6)
+            self._reset_pid_integrators()
         return True
 
     def _target_paddle_z(self, now_mono, over_ceiling=False):
