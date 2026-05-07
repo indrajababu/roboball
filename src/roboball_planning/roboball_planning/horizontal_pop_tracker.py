@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
-"""Continuous horizontal ball tracker with one bounded vertical pop per cycle."""
+"""Continuous horizontal ball tracker with one bounded vertical pop per cycle.
 
+Adds lightweight runtime rate tracking for:
+  * /ball_pose observer rate
+  * /strike_target observer rate
+  * /ball_state control-input rate
+  * control timer execution rate
+  * IK attempt/success rate
+  * velocity publish rate
+
+The rate trackers are intentionally passive. The /ball_pose and /strike_target
+subscriptions only count messages and do not affect control behavior.
+"""
+
+from collections import deque
 import subprocess
 import threading
 import time
 
 import numpy as np
 import rclpy
+from geometry_msgs.msg import PointStamped
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -15,7 +29,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from tf2_ros import Buffer, TransformException, TransformListener
 
-from roboball_msgs.msg import BallState
+from roboball_msgs.msg import BallState, StrikeTarget
 from roboball_planning.controller import PIDJointVelocityController
 from roboball_planning.ik import IKPlanner
 
@@ -37,6 +51,42 @@ DEFAULT_PADDLE_OFFSET_TOOL0 = [0.0, 0.0, 7.0 * INCH_TO_M]
 DEFAULT_BALL_TO_PADDLE_OFFSET = [-0.082, 0.094, 0.116]
 
 
+class RateTracker:
+    """Sliding-window Hz tracker."""
+
+    def __init__(self, window_sec=2.0):
+        self.window_sec = float(window_sec)
+        self.times = deque()
+        self.total = 0
+
+    def tick(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        self.total += 1
+        self.times.append(now)
+        self._trim(now)
+
+    def rate_hz(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        self._trim(now)
+        if len(self.times) < 2:
+            return 0.0
+        elapsed = self.times[-1] - self.times[0]
+        if elapsed <= 1e-9:
+            return 0.0
+        return (len(self.times) - 1) / elapsed
+
+    def age_sec(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        if not self.times:
+            return None
+        return now - self.times[-1]
+
+    def _trim(self, now):
+        cutoff = now - self.window_sec
+        while self.times and self.times[0] < cutoff:
+            self.times.popleft()
+
+
 class HorizontalPopTracker(Node):
     """Track ball XY at a locked height, popping once when the ball gets close."""
 
@@ -48,7 +98,13 @@ class HorizontalPopTracker(Node):
         super().__init__('horizontal_pop_tracker')
         self._cb_group = ReentrantCallbackGroup()
 
-        self.control_period = float(self.declare_parameter('control_period', 0.02).value)
+        self.control_period = float(self.declare_parameter('control_period', 0.05).value)
+        self.rate_log_period = float(
+            self.declare_parameter('rate_log_period', 1.0).value
+        )
+        self.rate_window_sec = float(
+            self.declare_parameter('rate_window_sec', 2.0).value
+        )
         self.pop_height = min(
             float(self.declare_parameter('pop_height', 6.0 * INCH_TO_M).value),
             6.0 * INCH_TO_M,
@@ -58,7 +114,7 @@ class HorizontalPopTracker(Node):
             6.0 * INCH_TO_M,
         )
         self.pop_trigger_clearance = float(
-            self.declare_parameter('pop_trigger_clearance', 15.0 * INCH_TO_M).value
+            self.declare_parameter('pop_trigger_clearance', 10.0 * INCH_TO_M).value
         )
         self.pop_hold_duration = float(
             self.declare_parameter('pop_hold_duration', 0.10).value
@@ -121,7 +177,7 @@ class HorizontalPopTracker(Node):
             dtype=np.float64,
         )
 
-        Kp = 2 * np.array([2.0, 2.0, 1.7, 1.5, 2.0, 2.0])
+        Kp = 0.2 * np.array([2.0, 2.0, 1.7, 1.5, 2.0, 2.0])
         Kd = 0.01 * np.array([2.0, 1.0, 2.0, 0.5, 0.8, 0.8])
         Ki = 0.01 * np.array([1.4, 1.4, 1.4, 1.0, 0.6, 0.6])
         self.pid = PIDJointVelocityController(
@@ -152,6 +208,16 @@ class HorizontalPopTracker(Node):
         self._lock = threading.Lock()
         self._tick_lock = threading.Lock()
 
+        self.ball_pose_rate = RateTracker(self.rate_window_sec)
+        self.strike_target_rate = RateTracker(self.rate_window_sec)
+        self.ball_state_rate = RateTracker(self.rate_window_sec)
+        self.control_tick_rate = RateTracker(self.rate_window_sec)
+        self.ik_attempt_rate = RateTracker(self.rate_window_sec)
+        self.ik_success_rate = RateTracker(self.rate_window_sec)
+        self.velocity_publish_rate = RateTracker(self.rate_window_sec)
+        self._last_rate_log_time = 0.0
+        self._last_ik_ms = None
+
         self.create_subscription(
             JointState,
             '/joint_states',
@@ -163,6 +229,20 @@ class HorizontalPopTracker(Node):
             BallState,
             '/ball_state',
             self._on_ball_state,
+            10,
+            callback_group=self._cb_group,
+        )
+        self.create_subscription(
+            PointStamped,
+            '/ball_pose',
+            self._on_ball_pose_observed,
+            10,
+            callback_group=self._cb_group,
+        )
+        self.create_subscription(
+            StrikeTarget,
+            '/strike_target',
+            self._on_strike_target_observed,
             10,
             callback_group=self._cb_group,
         )
@@ -192,7 +272,9 @@ class HorizontalPopTracker(Node):
             f'contact_height={self.contact_height}, '
             f'min_body_clearance_radius={self.min_body_clearance_radius:.3f}m, '
             f'max_joint_speed={self.max_joint_speed:.3f}rad/s, '
-            f'max_ik_joint_delta={self.max_ik_joint_delta:.3f}rad. '
+            f'max_ik_joint_delta={self.max_ik_joint_delta:.3f}rad, '
+            f'rate_window_sec={self.rate_window_sec:.2f}s, '
+            f'rate_log_period={self.rate_log_period:.2f}s. '
             'Z target is fixed except during the bounded pop.'
         )
 
@@ -201,9 +283,19 @@ class HorizontalPopTracker(Node):
             self.joint_state = msg
 
     def _on_ball_state(self, msg):
+        now = time.monotonic()
+        self.ball_state_rate.tick(now)
         with self._lock:
             self.ball_state = msg
-            self.ball_rx_time = time.monotonic()
+            self.ball_rx_time = now
+
+    def _on_ball_pose_observed(self, msg):
+        self.ball_pose_rate.tick()
+
+    def _on_strike_target_observed(self, msg):
+        with self._lock:
+            self.strike_target = msg
+        self.strike_target_rate.tick()
 
     def _control_tick(self):
         if not self._tick_lock.acquire(blocking=False):
@@ -217,10 +309,14 @@ class HorizontalPopTracker(Node):
         with self._lock:
             joint_state = self.joint_state
             ball_state = self.ball_state
+            # TODO strike_target = self.strike_target
             ball_rx_time = self.ball_rx_time
 
         if joint_state is None:
+            self._maybe_log_rates()
             return
+
+        self.control_tick_rate.tick()
 
         try:
             tf = self.tf_buffer.lookup_transform(BASE_FRAME, self.ee_frame, Time())
@@ -230,6 +326,7 @@ class HorizontalPopTracker(Node):
                 throttle_duration_sec=1.0,
             )
             self._publish_velocity(np.zeros(6))
+            self._maybe_log_rates()
             return
 
         tool_xyz = np.array([
@@ -306,6 +403,8 @@ class HorizontalPopTracker(Node):
         )
         qx, qy, qz, qw = self._locked_tool_quat
 
+        self.ik_attempt_rate.tick()
+        ik_start = time.monotonic()
         ik_solution = self.ik_planner.compute_ik(
             joint_state,
             tool_target_xyz[0],
@@ -318,9 +417,15 @@ class HorizontalPopTracker(Node):
             ik_link_name=self.ik_link_name,
             timeout_sec=self.ik_timeout,
         )
+        ik_elapsed = time.monotonic() - ik_start
+        self._last_ik_ms = ik_elapsed * 1000.0
+
         if ik_solution is None:
             self._publish_velocity(np.zeros(6))
+            self._maybe_log_rates()
             return
+
+        self.ik_success_rate.tick()
 
         current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
         target_pos = _reorder_positions(ik_solution, JOINT_ORDER)
@@ -334,12 +439,14 @@ class HorizontalPopTracker(Node):
             )
             self.pid.integral_error = np.zeros(6)
             self._publish_velocity(np.zeros(6))
+            self._maybe_log_rates()
             return
         target_pos = current_pos + target_delta
         target_vel = np.zeros(6)
         cmd = self.pid.step_control(target_pos, target_vel, current_pos, current_vel)
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
         self._publish_velocity(cmd)
+        self._maybe_log_rates()
 
     def _update_pop_state(self, now_mono, ball_pos):
         ball_clearance = float(ball_pos[2] - self._nominal_paddle_z)
@@ -424,7 +531,39 @@ class HorizontalPopTracker(Node):
             )
         return self._nominal_paddle_z
 
+    def _maybe_log_rates(self):
+        now = time.monotonic()
+        if now - self._last_rate_log_time < self.rate_log_period:
+            return
+        self._last_rate_log_time = now
+
+        def fmt_age(age):
+            return 'none' if age is None else f'{age:.3f}s'
+
+        last_ik = (
+            'none'
+            if self._last_ik_ms is None
+            else f'{self._last_ik_ms:.1f}ms'
+        )
+
+        self.get_logger().info(
+            'rates: '
+            f'ball_pose={self.ball_pose_rate.rate_hz(now):.1f}Hz '
+            f'(age={fmt_age(self.ball_pose_rate.age_sec(now))}), '
+            f'strike_target={self.strike_target_rate.rate_hz(now):.1f}Hz '
+            f'(age={fmt_age(self.strike_target_rate.age_sec(now))}), '
+            f'ball_state={self.ball_state_rate.rate_hz(now):.1f}Hz '
+            f'(age={fmt_age(self.ball_state_rate.age_sec(now))}), '
+            f'control_tick={self.control_tick_rate.rate_hz(now):.1f}Hz, '
+            f'ik_attempt={self.ik_attempt_rate.rate_hz(now):.1f}Hz, '
+            f'ik_success={self.ik_success_rate.rate_hz(now):.1f}Hz, '
+            f'vel_pub={self.velocity_publish_rate.rate_hz(now):.1f}Hz, '
+            f'last_ik={last_ik}, '
+            f'state={self._state}'
+        )
+
     def _publish_velocity(self, cmd):
+        self.velocity_publish_rate.tick()
         msg = Float64MultiArray()
         msg.data = list(map(float, cmd))
         self.velocity_pub.publish(msg)
