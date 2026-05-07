@@ -35,6 +35,10 @@ IK_LINK_NAME = 'tool0'
 INCH_TO_M = 0.0254
 DEFAULT_PADDLE_OFFSET_TOOL0 = [0.0, 0.0, 7.0 * INCH_TO_M]
 DEFAULT_BALL_TO_PADDLE_OFFSET = [-0.082, 0.094, 0.116]
+# Pure 90° rotation about base_link y. With the paddle mounted square on tool0,
+# this puts the paddle face normal exactly along base_link +z (perfectly
+# horizontal). (qx, qy, qz, qw).
+HORIZONTAL_TOOL_QUAT = (0.0, float(np.sqrt(0.5)), 0.0, float(np.sqrt(0.5)))
 
 
 class HorizontalPopTracker(Node):
@@ -159,7 +163,7 @@ class HorizontalPopTracker(Node):
         self.ball_state = None
         self.ball_rx_time = None
         self._nominal_paddle_z = self.contact_height
-        self._locked_tool_quat = None
+        self._locked_tool_quat = HORIZONTAL_TOOL_QUAT
         self._last_target_xy = None
         self._state = self.TRACK
         self._pop_start_time = None
@@ -272,8 +276,6 @@ class HorizontalPopTracker(Node):
             self.get_logger().info(
                 f'Locked paddle height at {self._nominal_paddle_z:.3f}m.'
             )
-        if self._locked_tool_quat is None:
-            self._locked_tool_quat = tool_quat
 
         now_mono = time.monotonic()
         over_ceiling = self._enforce_vertical_ceiling(
