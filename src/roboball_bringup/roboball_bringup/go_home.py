@@ -63,7 +63,7 @@ HOME_POSITIONS = [
     -2.316411157647604,   # shoulder_lift_joint
     -1.810107946395874,  # elbow_joint
     1.0502943235584716,   # wrist_1_joint
-    2.0732617378234863,   # wrist_2_joint
+    1.6532617378234867,   # wrist_2_joint
     -1.5386202971087855,  # wrist_3_joint
     5.799105644226074,    # shoulder_pan_joint
 ]

@@ -97,7 +97,7 @@ class HorizontalPopTracker(Node):
             else None
         )
         self.min_body_clearance_radius = float(
-            self.declare_parameter('min_body_clearance_radius', 0.30).value
+            self.declare_parameter('min_body_clearance_radius', 0.35).value
         )
         self.ball_timeout = float(self.declare_parameter('ball_timeout', 0.35).value)
         self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.06).value)
@@ -160,6 +160,7 @@ class HorizontalPopTracker(Node):
         self.ball_rx_time = None
         self._nominal_paddle_z = self.contact_height
         self._locked_tool_quat = None
+        self._initial_target_theta = None
         self._last_target_xy = None
         self._state = self.TRACK
         self._pop_start_time = None
@@ -274,6 +275,13 @@ class HorizontalPopTracker(Node):
             )
         if self._locked_tool_quat is None:
             self._locked_tool_quat = tool_quat
+        if self._initial_target_theta is None:
+            self._initial_target_theta = float(np.arctan2(
+                current_paddle_xyz[1], current_paddle_xyz[0]
+            ))
+            self.get_logger().info(
+                f'Locked initial radial angle at {self._initial_target_theta:.3f}rad.'
+            )
 
         now_mono = time.monotonic()
         over_ceiling = self._enforce_vertical_ceiling(
@@ -326,12 +334,15 @@ class HorizontalPopTracker(Node):
             target_xy[1],
             target_z,
         ], dtype=np.float64)
+        theta_target = float(np.arctan2(target_xy[1], target_xy[0]))
+        delta_theta = theta_target - self._initial_target_theta
+        q_target = _rotate_quat_about_world_z(self._locked_tool_quat, delta_theta)
         tool_target_xyz = _paddle_to_tool_xyz(
             target_paddle_xyz,
-            self._locked_tool_quat,
+            q_target,
             self.paddle_offset_tool0,
         )
-        qx, qy, qz, qw = self._locked_tool_quat
+        qx, qy, qz, qw = q_target
 
         ik_solution = self.ik_planner.compute_ik(
             joint_state,
@@ -557,6 +568,23 @@ def _clamp_xy_away_from_body(xy, min_radius):
     if radius < 1e-9:
         return np.array([min_radius, 0.0], dtype=np.float64)
     return point * (min_radius / radius)
+
+
+def _quat_multiply(q1, q2):
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return (
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    )
+
+
+def _rotate_quat_about_world_z(q, delta_theta):
+    half = 0.5 * float(delta_theta)
+    q_dz = (0.0, 0.0, np.sin(half), np.cos(half))
+    return _quat_multiply(q_dz, q)
 
 
 def _quat_to_rot(x, y, z, w):
