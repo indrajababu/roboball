@@ -38,7 +38,12 @@ DEFAULT_BALL_TO_PADDLE_OFFSET = [-0.082, 0.094, 0.116]
 # Pure 90° rotation about base_link y. With the paddle mounted square on tool0,
 # this puts the paddle face normal exactly along base_link +z (perfectly
 # horizontal). (qx, qy, qz, qw).
-#HORIZONTAL_TOOL_QUAT = (0.0, float(np.sqrt(0.5)), 0.0, float(np.sqrt(0.5)))
+HORIZONTAL_TOOL_QUAT = (0.0, float(np.sqrt(0.5)), 0.0, float(np.sqrt(0.5)))
+# Direction of the paddle face normal expressed in tool0 frame. With the
+# calibrated horizontal quaternion (≈90° about base_y), tool -x maps to base
+# +z, so the paddle face must be normal to tool -x. Override via parameter if
+# the paddle is remounted on a different axis.
+DEFAULT_PADDLE_NORMAL_TOOL0 = [-1.0, 0.0, 0.0]
 
 
 class HorizontalPopTracker(Node):
@@ -93,7 +98,7 @@ class HorizontalPopTracker(Node):
         )
         self._pop_paddle_velocity = 0.0
         configured_contact_height = float(
-            self.declare_parameter('contact_height', .38).value
+            self.declare_parameter('contact_height', float("nan")).value
         )
         self.contact_height = (
             configured_contact_height
@@ -134,6 +139,16 @@ class HorizontalPopTracker(Node):
             ).value,
             dtype=np.float64,
         )
+        self.paddle_normal_tool0 = np.array(
+            self.declare_parameter(
+                'paddle_normal_tool0',
+                DEFAULT_PADDLE_NORMAL_TOOL0,
+            ).value,
+            dtype=np.float64,
+        )
+        n_norm = float(np.linalg.norm(self.paddle_normal_tool0))
+        if n_norm > 1e-9:
+            self.paddle_normal_tool0 /= n_norm
 
         Kp = 2 * np.array([2.0, 2.0, 1.7, 1.5, 2.0, 2.0])
         Kd = 0.01 * np.array([2.0, 1.0, 2.0, 0.5, 0.8, 0.8])
@@ -163,7 +178,7 @@ class HorizontalPopTracker(Node):
         self.ball_state = None
         self.ball_rx_time = None
         self._nominal_paddle_z = self.contact_height
-        self._locked_tool_quat = (0, 0, 0, 1)
+        self._locked_tool_quat = None
         self._last_target_xy = None
         self._state = self.TRACK
         self._pop_start_time = None
@@ -279,6 +294,17 @@ class HorizontalPopTracker(Node):
             self._nominal_paddle_z = float(current_paddle_xyz[2])
             self.get_logger().info(
                 f'Locked paddle height at {self._nominal_paddle_z:.3f}m.'
+            )
+        if self._locked_tool_quat is None:
+            leveled, swing_angle = _level_paddle_quat(
+                tool_quat,
+                self.paddle_normal_tool0,
+            )
+            self._locked_tool_quat = leveled
+            self.get_logger().info(
+                f'Locked paddle-leveled tool quat=({leveled[0]:.4f}, '
+                f'{leveled[1]:.4f}, {leveled[2]:.4f}, {leveled[3]:.4f}). '
+                f'Swing from current = {np.degrees(swing_angle):.2f} deg.'
             )
 
         now_mono = time.monotonic()
@@ -571,6 +597,57 @@ def _quat_to_rot(x, y, z, w):
         [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
     ], dtype=np.float64)
+
+
+def _quat_multiply(q1, q2):
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return (
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    )
+
+
+def _level_paddle_quat(current_quat, paddle_normal_tool):
+    """Smallest-rotation correction of current_quat that makes the paddle face
+    normal point along base_link +z.
+
+    Decomposes the rotation into swing (around an axis perpendicular to the
+    face normal) and twist (around the face normal). We zero out the swing
+    needed to bring the face normal to vertical and leave the twist of the
+    current orientation untouched. Returns (leveled_quat, swing_angle_rad).
+    """
+    n_tool = np.asarray(paddle_normal_tool, dtype=np.float64)
+    n_tool = n_tool / max(float(np.linalg.norm(n_tool)), 1e-12)
+    R = _quat_to_rot(*current_quat)
+    n_base = R @ n_tool
+    n_base /= max(float(np.linalg.norm(n_base)), 1e-12)
+    target = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    cos_a = float(np.clip(np.dot(n_base, target), -1.0, 1.0))
+    axis = np.cross(n_base, target)
+    sin_a = float(np.linalg.norm(axis))
+    if sin_a < 1e-9:
+        if cos_a > 0.0:
+            return tuple(float(v) for v in current_quat), 0.0
+        # 180° flip — pick any axis perpendicular to n_base.
+        seed = np.array([1.0, 0.0, 0.0]) if abs(n_base[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        axis = seed - n_base * float(np.dot(seed, n_base))
+        axis /= max(float(np.linalg.norm(axis)), 1e-12)
+        sin_a = 1.0
+        cos_a = -1.0
+    else:
+        axis /= sin_a
+    angle = float(np.arctan2(sin_a, cos_a))
+    half = 0.5 * angle
+    s = float(np.sin(half))
+    correction = (axis[0] * s, axis[1] * s, axis[2] * s, float(np.cos(half)))
+    leveled = _quat_multiply(correction, current_quat)
+    norm = float(np.sqrt(sum(c * c for c in leveled)))
+    if norm > 1e-12:
+        leveled = tuple(c / norm for c in leveled)
+    return leveled, angle
 
 
 def main(args=None):
