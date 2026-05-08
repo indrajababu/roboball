@@ -237,6 +237,7 @@ class HorizontalPopTracker(Node):
             self._tick_lock.release()
 
     def _control_tick_impl(self):
+        t00 = time.perf_counter()
         with self._lock:
             joint_state = self.joint_state
             ball_state = self.ball_state
@@ -347,7 +348,7 @@ class HorizontalPopTracker(Node):
             self.paddle_offset_tool0,
         )
         qx, qy, qz, qw = q_target
-
+        t0 = time.perf_counter()
         ik_solution = self.ik_planner.compute_ik(
             joint_state,
             tool_target_xyz[0],
@@ -363,7 +364,10 @@ class HorizontalPopTracker(Node):
         if ik_solution is None:
             self._publish_velocity(np.zeros(6))
             return
-
+        ik_ms = (time.perf_counter() - t0) * 1000.0
+        self.get_logger().info(
+            f"iK took {ik_ms: .1f} ms "
+        )
         current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
         target_pos = _reorder_positions(ik_solution, JOINT_ORDER)
         target_delta = _shortest_joint_delta(target_pos, current_pos)
@@ -383,6 +387,10 @@ class HorizontalPopTracker(Node):
         cmd = active_pid.step_control(target_pos, target_vel, current_pos, current_vel)
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
         self._publish_velocity(cmd)
+        control_ms = (time.perf_counter() - t00) * 1000.0
+        self.get_logger().info(
+            f"iK took {control_ms: .1f} ms "
+        )
 
     def _update_pop_state(self, now_mono, ball_pos, ball_vel):
         ball_vel_z = float(ball_vel[2])
@@ -493,7 +501,7 @@ class HorizontalPopTracker(Node):
             time_elapsed = now_mono - self._pop_start_time
             scale = self._smooth_bump(time_elapsed / self.pop_duration)
 
-            time_based_hit = current_paddle_z + self.pop_height * scale
+            time_based_hit = self._nominal_paddle_z + self.pop_height * scale
             return min(
                 time_based_hit,
                 ceiling_z,
