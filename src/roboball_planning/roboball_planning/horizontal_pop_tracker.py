@@ -521,7 +521,7 @@ class HorizontalPopTracker(Node):
 
         if self._state == self.POP:
             return min(
-                current_paddle_z + self._pop_paddle_velocity * self.control_period,
+                current_paddle_z + self._pop_paddle_velocity * self.control_period * 2.5,
                 ceiling_z,
             )
 
