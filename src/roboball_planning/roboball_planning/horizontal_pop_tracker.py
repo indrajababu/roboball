@@ -96,12 +96,12 @@ class HorizontalPopTracker(Node):
         self.max_hit_velocity = float(
             self.declare_parameter('max_hit_velocity', 3.0).value
         )
-        self.ticks_per_peak = float(
+        self.ticks_per_peak = max(1,
             self.declare_parameter('ticks_per_peak', 4).value
         )
         self._pop_paddle_velocity = 0.0
         configured_contact_height = float(
-            self.declare_parameter('contact_height', float("nan")).value
+            int(self.declare_parameter('contact_height', float("nan")).value)
         )
         self.contact_height = (
             configured_contact_height
@@ -317,10 +317,6 @@ class HorizontalPopTracker(Node):
             )
 
         now_mono = time.monotonic()
-        over_ceiling = self._enforce_vertical_ceiling(
-            now_mono=now_mono,
-            current_paddle_z=float(current_paddle_xyz[2]),
-        )
 
         ball_valid = (
             ball_state is not None
@@ -335,6 +331,7 @@ class HorizontalPopTracker(Node):
 
         if self._last_target_xy is not None:
             target_xy = self._last_target_xy.copy()
+
 
         if ball_valid:
             ball_pos = np.array([
@@ -361,6 +358,7 @@ class HorizontalPopTracker(Node):
             should_bounce = 0.0 <= ball_clearance <= self.pop_trigger_clearance
         else:
             ball_clearance = float("nan")
+            self._last_target_xy = target_xy.copy()
 
         """ 
         if self._last_target_xy is not None:
@@ -401,7 +399,7 @@ class HorizontalPopTracker(Node):
         if should_bounce:
             if not self._was_bouncing:
                 self._was_bouncing = True
-                self._bounc_high = True
+                self._bounce_high = True
                 self._tick_counter = 0
             else:
                 self._tick_counter += 1
