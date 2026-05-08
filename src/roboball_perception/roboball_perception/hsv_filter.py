@@ -1,13 +1,3 @@
-"""Per-point HSV color filter for RealSense colored point clouds.
-
-Pure NumPy/OpenCV — no ROS imports. Used by `ball_detector.py` to gate
-points by color before centroid computation.
-
-The RealSense `/camera/camera/depth/color/points` topic publishes
-`sensor_msgs/PointCloud2` with an `rgb` field that is a 32-bit float whose
-underlying bytes are 0x00 RR GG BB. We unpack it without leaving NumPy.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -24,46 +14,52 @@ class HSVRange:
     upper: Sequence[int]
 
     def as_arrays(self) -> tuple[np.ndarray, np.ndarray]:
-        return (np.array(self.lower, dtype=np.uint8),
-                np.array(self.upper, dtype=np.uint8))
+        return (
+            np.asarray(self.lower, dtype=np.uint8),
+            np.asarray(self.upper, dtype=np.uint8),
+        )
 
 
 def unpack_rgb_float(rgb_packed: np.ndarray) -> np.ndarray:
-    """Decode the PointCloud2 packed-float `rgb` field into an Nx3 uint8 array.
+    """Decode PointCloud2 packed-float rgb into Nx3 BGR uint8.
 
-    Each scalar's raw 4 bytes are 0x00 RR GG BB (PCL convention). Output is
-    BGR-ordered to match OpenCV — i.e. column 0 is blue, 1 is green, 2 is red.
+    Faster version: avoids np.stack allocation by preallocating output.
     """
     rgb_packed = np.ascontiguousarray(rgb_packed, dtype=np.float32)
     raw = rgb_packed.view(np.uint32)
-    b = (raw & 0xFF).astype(np.uint8)
-    g = ((raw >> 8) & 0xFF).astype(np.uint8)
-    r = ((raw >> 16) & 0xFF).astype(np.uint8)
-    return np.stack([b, g, r], axis=1)
+
+    bgr = np.empty((raw.shape[0], 3), dtype=np.uint8)
+    bgr[:, 0] = raw & 0xFF
+    bgr[:, 1] = (raw >> 8) & 0xFF
+    bgr[:, 2] = (raw >> 16) & 0xFF
+    return bgr
 
 
 def hsv_mask_from_bgr(bgr: np.ndarray, ranges: Sequence[HSVRange]) -> np.ndarray:
-    """Vectorized point-wise HSV mask. `bgr` is Nx3 uint8.
-
-    Returns a boolean array of length N: True where the point's color falls
-    within ANY of the supplied HSV ranges (OR'd, for red wraparound).
-    """
-    if bgr.size == 0:
+    """Vectorized HSV mask. Faster version using cv2.inRange."""
+    n = bgr.shape[0]
+    if n == 0:
         return np.zeros(0, dtype=bool)
 
-    strip = bgr.reshape(1, -1, 3)
-    hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    # OpenCV accepts Nx1x3 or 1xNx3. Nx1x3 is natural for point lists.
+    hsv = cv2.cvtColor(bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV)
 
-    combined = np.zeros(hsv.shape[0], dtype=bool)
+    if len(ranges) == 1:
+        lo, hi = ranges[0].as_arrays()
+        return cv2.inRange(hsv, lo, hi).reshape(-1).astype(bool)
+
+    combined = np.zeros((n,), dtype=np.uint8)
     for r in ranges:
         lo, hi = r.as_arrays()
-        in_range = np.all((hsv >= lo) & (hsv <= hi), axis=1)
-        combined |= in_range
-    return combined
+        combined |= cv2.inRange(hsv, lo, hi).reshape(-1)
+
+    return combined.astype(bool)
 
 
-def hsv_mask_from_packed_rgb(rgb_packed: np.ndarray,
-                             ranges: Sequence[HSVRange]) -> np.ndarray:
+def hsv_mask_from_packed_rgb(
+    rgb_packed: np.ndarray,
+    ranges: Sequence[HSVRange],
+) -> np.ndarray:
     """Convenience: unpack PointCloud2 rgb floats then HSV-filter."""
     bgr = unpack_rgb_float(rgb_packed)
     return hsv_mask_from_bgr(bgr, ranges)
