@@ -178,7 +178,7 @@ class HorizontalPopTracker(Node):
         self.ball_state = None
         self.ball_rx_time = None
         self._nominal_paddle_z = self.contact_height
-        self._locked_tool_quat = None
+        self._locked_tool_quat = None #(0, 0, 0, 1)
         self._last_target_xy = None
         self._state = self.TRACK
         self._pop_start_time = None
@@ -353,11 +353,18 @@ class HorizontalPopTracker(Node):
             current_paddle_z=float(current_paddle_xyz[2]),
             over_ceiling=over_ceiling,
         )
+
+        
+        # TODO changed so that we no longer move along the xy plane when moving up
         target_paddle_xyz = np.array([
             target_xy[0],
             target_xy[1],
             target_z,
         ], dtype=np.float64)
+
+        if target_z - current_paddle_xyz[2] > 0.1:
+            target_paddle_xyz[:2] = current_paddle_xyz[:2]
+        
         tool_target_xyz = _paddle_to_tool_xyz(
             target_paddle_xyz,
             self._locked_tool_quat,
