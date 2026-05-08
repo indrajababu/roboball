@@ -100,6 +100,9 @@ class HorizontalPopTracker(Node):
             1,
             int(self.declare_parameter('ticks_per_peak', 12).value)
         )
+        self.bounce_lead_time = float(
+            self.declare_parameter('bounce_lead_time', 0.18).value
+        )
         self._pop_paddle_velocity = 0.0
         configured_contact_height = float(
             self.declare_parameter('contact_height', float("nan")).value
@@ -357,44 +360,34 @@ class HorizontalPopTracker(Node):
             )
             self._last_target_xy = target_xy.copy()
             ball_clearance = float(ball_state.position.z - self._nominal_paddle_z)
-            should_bounce = 0.0 <= ball_clearance <= self.pop_trigger_clearance
+            vz = float(ball_state.velocity.z)
         else:
             ball_clearance = float("nan")
+            vz = float("nan")
             
-
-        """ 
-        if self._last_target_xy is not None:
-            target_xy = self._last_target_xy.copy()
-        if ball_valid:
-            ball_pos = np.array([
-                ball_state.position.x,
-                ball_state.position.y,
-                ball_state.position.z,
-            ], dtype=np.float64)
-            ball_vel = np.array([
-                ball_state.velocity.x,
-                ball_state.velocity.y,
-                ball_state.velocity.z,
-            ], dtype=np.float64)
-            target_xy = (
-                ball_pos[:2]
-                - self.ball_to_paddle_offset[:2]
-                - self.ball_to_paddle_offset_margin[:2]
-            )
-            target_xy = _clamp_xy_away_from_body(
-                target_xy,
-                self.min_body_clearance_radius,
-            )
-            self._last_target_xy = target_xy.copy()
-            self._update_pop_state(now_mono, ball_pos, ball_vel)
+        if vz < -0.05:
+            time_to_contact = ball_clearance / (-vz)
         else:
-            self._finish_pop_state_without_ball(now_mono)
+            time_to_contact = float("inf")
 
-        target_z = self._target_paddle_z(
-            now_mono,
-            current_paddle_z=float(current_paddle_xyz[2]),
-            over_ceiling=over_ceiling,
-        ) """
+        should_pop_up = (
+            0.0 <= ball_clearance <= self.pop_trigger_clearance
+            or 0.03 <= time_to_contact <= self.bounce_lead_time
+        )
+
+        high_z = min(
+            self._nominal_paddle_z + self.pop_height,
+            self._nominal_paddle_z + self.max_vertical_rise,
+        )
+
+        if should_pop_up:
+            target_z = high_z
+            active_pid = self.pid_vertical
+        else:
+            target_z = self._nominal_paddle_z
+            active_pid = self.pid
+        
+        """ 
         high_z = min(self._nominal_paddle_z + self.pop_height,
                      self._nominal_paddle_z + self.max_vertical_rise)
         
@@ -417,7 +410,7 @@ class HorizontalPopTracker(Node):
             self._tick_counter = 0
             self._bounce_high = False
             self._was_bouncing = False
-            target_z = self._nominal_paddle_z
+            target_z = self._nominal_paddle_z """
         
         # TODO changed so that we no longer move along the xy plane when moving up
         target_paddle_xyz = np.array([
