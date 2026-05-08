@@ -59,15 +59,15 @@ class HorizontalPopTracker(Node):
 
         self.control_period = float(self.declare_parameter('control_period', 0.01).value)
         self.pop_height = min(
-            float(self.declare_parameter('pop_height', 12.0 * INCH_TO_M).value),
+            float(self.declare_parameter('pop_height', 20 * INCH_TO_M).value),
             60.0 * INCH_TO_M,
         )
         self.max_vertical_rise = min(
-            float(self.declare_parameter('max_vertical_rise', 12.0 * INCH_TO_M).value),
+            float(self.declare_parameter('max_vertical_rise', 20 * INCH_TO_M).value),
             60.0 * INCH_TO_M,
         )
         self.pop_trigger_clearance = float(
-            self.declare_parameter('pop_trigger_clearance', 36 * INCH_TO_M).value
+            self.declare_parameter('pop_trigger_clearance', 30 * INCH_TO_M).value
         )
         self.pop_hold_duration = float(
             self.declare_parameter('pop_hold_duration', 0.12).value
@@ -85,7 +85,7 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('min_pop_interval', 0.10).value
         )
         self.descending_velocity_threshold = float(
-            self.declare_parameter('descending_velocity_threshold', -0.02).value
+            self.declare_parameter('descending_velocity_threshold', -0.035).value
         )
         self.hit_velocity_gain = float(
             self.declare_parameter('hit_velocity_gain', 2).value
@@ -158,7 +158,7 @@ class HorizontalPopTracker(Node):
         if n_norm > 1e-9:
             self.paddle_normal_tool0 /= n_norm
 
-        Kp = 2 * np.array([2.0, 2.0, 1.7, 1.5, 2.0, 2.0])
+        Kp = 2 * np.array([3.0, 2.0, 2.0, 2.0, 3.0, 2.0])
         Kd = 0.01 * np.array([2.0, 1.0, 2.0, 0.5, 0.8, 0.8])
         Ki = 0.01 * np.array([1.4, 1.4, 1.4, 1.0, 0.6, 0.6])
         self.pid = PIDJointVelocityController(
@@ -171,7 +171,8 @@ class HorizontalPopTracker(Node):
         )
         self.pid_vertical = PIDJointVelocityController(
             self,
-            Kp * 5,
+            13 * np.array([0.5, 1.5, 1.5, 1.0, 1.0, 1.0]), #positive direction brings 
+            #ee up in all cases! for joints 1-3
             Ki,
             Kd,
             dt=self.control_period,
@@ -332,8 +333,6 @@ class HorizontalPopTracker(Node):
 
         target_xy = current_paddle_xyz[:2]
 
-        should_bounce = False
-
         if self._last_target_xy is not None:
             target_xy = self._last_target_xy.copy()
 
@@ -370,7 +369,9 @@ class HorizontalPopTracker(Node):
         else:
             time_to_contact = float("inf")
 
-        should_pop_up = (
+        falling = vz <= self.descending_velocity_threshold
+
+        should_pop_up = falling and (
             0.0 <= ball_clearance <= self.pop_trigger_clearance
             or 0.03 <= time_to_contact <= self.bounce_lead_time
         )
@@ -462,7 +463,7 @@ class HorizontalPopTracker(Node):
             return
         target_pos = current_pos + target_delta
         target_vel = np.zeros(6)        
-        active_pid = self.pid_vertical if should_bounce else self.pid
+        active_pid = self.pid_vertical if should_pop_up else self.pid
         cmd = active_pid.step_control(target_pos, target_vel, current_pos, current_vel)
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
         control_ms = (time.perf_counter() - t00) * 1000.0
