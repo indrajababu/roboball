@@ -67,10 +67,10 @@ class HorizontalPopTracker(Node):
             6.0 * INCH_TO_M,
         )
         self.pop_trigger_clearance = float(
-            self.declare_parameter('pop_trigger_clearance', 17.5 * INCH_TO_M).value
+            self.declare_parameter('pop_trigger_clearance', 36 * INCH_TO_M).value
         )
         self.pop_hold_duration = float(
-            self.declare_parameter('pop_hold_duration', 0.01).value
+            self.declare_parameter('pop_hold_duration', 0.12).value
         )
         self.recovery_duration = float(
             self.declare_parameter('recovery_duration', 0.5).value
@@ -85,7 +85,7 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('min_pop_interval', 0.10).value
         )
         self.descending_velocity_threshold = float(
-            self.declare_parameter('descending_velocity_threshold', -0.03).value
+            self.declare_parameter('descending_velocity_threshold', -0.02).value
         )
         self.hit_velocity_gain = float(
             self.declare_parameter('hit_velocity_gain', 2).value
@@ -109,9 +109,9 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('min_body_clearance_radius', 0.30).value
         )
         self.ball_timeout = float(self.declare_parameter('ball_timeout', 0.35).value)
-        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.2).value)
+        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.02).value)
         self.max_joint_speed = float(
-            self.declare_parameter('max_joint_speed', 1.0).value
+            self.declare_parameter('max_joint_speed', 2.0).value
         )
         self.max_ik_joint_delta = float(
             self.declare_parameter('max_ik_joint_delta', np.pi / 4.0).value
@@ -173,7 +173,7 @@ class HorizontalPopTracker(Node):
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-
+        self._time_log = True
         self.joint_state = None
         self.ball_state = None
         self.ball_rx_time = None
@@ -251,6 +251,8 @@ class HorizontalPopTracker(Node):
             self._tick_lock.release()
 
     def _control_tick_impl(self):
+        
+        t00 = time.perf_counter()
         with self._lock:
             joint_state = self.joint_state
             ball_state = self.ball_state
@@ -371,7 +373,7 @@ class HorizontalPopTracker(Node):
             self.paddle_offset_tool0,
         )
         qx, qy, qz, qw = self._locked_tool_quat
-
+        t0 = time.perf_counter()
         ik_solution = self.ik_planner.compute_ik(
             joint_state,
             tool_target_xyz[0],
@@ -387,6 +389,11 @@ class HorizontalPopTracker(Node):
         if ik_solution is None:
             self._publish_velocity(np.zeros(6))
             return
+        ik_ms = (time.perf_counter() - t0) * 1000.0
+        if self._time_log:
+            self.get_logger().info(
+                f"ik_ms took {ik_ms:.1f} ms"
+            )
 
         current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
         target_pos = _reorder_positions(ik_solution, JOINT_ORDER)
@@ -406,6 +413,13 @@ class HorizontalPopTracker(Node):
         active_pid = self.pid_vertical if self._state in (self.POP, self.RECOVER) else self.pid
         cmd = active_pid.step_control(target_pos, target_vel, current_pos, current_vel)
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
+        control_ms = (time.perf_counter() - t00) * 1000.0
+
+        if self._time_log:
+            self.get_logger().info(
+            f"control_ms took {control_ms:.1f} ms"
+        )
+
         self._publish_velocity(cmd)
 
     def _update_pop_state(self, now_mono, ball_pos, ball_vel):
@@ -427,7 +441,7 @@ class HorizontalPopTracker(Node):
             ready_by_velocity = ball_vel_z <= self.descending_velocity_threshold
             ready_by_time = now_mono - self._last_pop_time >= self.min_pop_interval
 
-            if self._pop_armed and ready_by_height and ready_by_velocity and ready_by_time:
+            if ready_by_height:
                 incoming_speed = max(0.0, -ball_vel_z)
                 self._pop_paddle_velocity = float(np.clip(
                     self.hit_velocity_gain * incoming_speed,
