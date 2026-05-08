@@ -96,6 +96,9 @@ class HorizontalPopTracker(Node):
         self.max_hit_velocity = float(
             self.declare_parameter('max_hit_velocity', 3.0).value
         )
+        self.ticks_per_peak = float(
+            self.declare_parameter('ticks_per_peak', 9.0).value
+        )
         self._pop_paddle_velocity = 0.0
         configured_contact_height = float(
             self.declare_parameter('contact_height', float("nan")).value
@@ -116,6 +119,7 @@ class HorizontalPopTracker(Node):
         self.max_ik_joint_delta = float(
             self.declare_parameter('max_ik_joint_delta', np.pi / 4.0).value
         )
+        
         self.ee_frame = str(self.declare_parameter('ee_frame', EE_FRAME).value)
         self.ik_link_name = str(self.declare_parameter('ik_link_name', IK_LINK_NAME).value)
         self.paddle_offset_tool0 = np.array(
@@ -183,6 +187,8 @@ class HorizontalPopTracker(Node):
         self._state = self.TRACK
         self._pop_start_time = None
         self._recover_start_time = None
+        self._tick_counter = 0
+        self._bounce_high = True
         self._pop_armed = True
         self._last_pop_time = -1e9
         self._ceiling_active = False
@@ -323,7 +329,10 @@ class HorizontalPopTracker(Node):
         )
 
         target_xy = current_paddle_xyz[:2]
-        if self._last_target_xy is not None:
+        ball_clearance = ball_state.position.z - current_paddle_xyz[2]
+        should_bounce = 0.0 <= ball_clearance <= self.pop_trigger_clearance
+
+        """ if self._last_target_xy is not None:
             target_xy = self._last_target_xy.copy()
         if ball_valid:
             ball_pos = np.array([
@@ -354,8 +363,22 @@ class HorizontalPopTracker(Node):
             now_mono,
             current_paddle_z=float(current_paddle_xyz[2]),
             over_ceiling=over_ceiling,
-        )
+        ) """
 
+        if should_bounce:
+            self._tick_counter += 1
+            if self._tick_counter >= self.ticks_per_peak:
+                self._bounce_high = not self._bounce_high
+                self._tick_counter = 0
+
+            target_z = (self._nominal_paddle_z + self.pop_height
+                if self._bounce_high
+                else self._nominal_paddle_z
+            )
+        else:
+            self._tick_counter = 0
+            self._bounce_high = False
+            target_z = self._nominal_paddle_z
         
         # TODO changed so that we no longer move along the xy plane when moving up
         target_paddle_xyz = np.array([
@@ -364,9 +387,6 @@ class HorizontalPopTracker(Node):
             target_z,
         ], dtype=np.float64)
 
-        if target_z - current_paddle_xyz[2] > 0.1:
-            target_paddle_xyz[:2] = current_paddle_xyz[:2]
-        
         tool_target_xyz = _paddle_to_tool_xyz(
             target_paddle_xyz,
             self._locked_tool_quat,
@@ -519,13 +539,13 @@ class HorizontalPopTracker(Node):
 
         ceiling_z = self._nominal_paddle_z + self.max_vertical_rise
 
-        if self._state == self.POP:
-            return min(
-                current_paddle_z + self._pop_paddle_velocity * self.control_period * 2.5,
+        #if self._state == self.POP:
+        return min(
+                current_paddle_z + self._pop_paddle_velocity * self.control_period * 1.5,
                 ceiling_z,
             )
 
-        return self._nominal_paddle_z
+        #return self._nominal_paddle_z
 
     def _publish_velocity(self, cmd):
         msg = Float64MultiArray()
