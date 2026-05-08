@@ -406,7 +406,14 @@ class HorizontalPopTracker(Node):
         active_pid = self.pid_vertical if self._state in (self.POP, self.RECOVER) else self.pid
         cmd = active_pid.step_control(target_pos, target_vel, current_pos, current_vel)
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
+
+        control_ms = (time.perf_counter() - t00) * 1000.0
+        self.get_logger().info(
+            f"control_ms took {control_ms: .1f} ms "
+        )
+        
         self._publish_velocity(cmd)
+        
 
     def _update_pop_state(self, now_mono, ball_pos, ball_vel):
         ball_vel_z = float(ball_vel[2])
