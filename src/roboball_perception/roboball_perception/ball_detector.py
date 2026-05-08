@@ -95,7 +95,7 @@ class BallDetector(Node):
         self.max_y = float(self.declare_parameter('max_y',  0.80).value)
         self.min_z = float(self.declare_parameter('min_z',  0.00).value)
         self.max_z = float(self.declare_parameter('max_z',  2.00).value)
-        self.cloud_stride = max(1, int(self.declare_parameter('cloud_stride', 2).value))
+        self.cloud_stride = max(1, int(self.declare_parameter('cloud_stride', 4).value))
 
         # ---- YOLO params ------------------------------------------------
         self.yolo_weights = str(self.declare_parameter('yolo_weights', 'yolov8n.pt').value)
@@ -125,6 +125,10 @@ class BallDetector(Node):
         self.add_on_set_parameters_callback(self._on_parameter_update)
 
         # ---- backend-specific init -------------------------------------
+        self.publish_filtered_points = bool(
+            self.declare_parameter('publish_filtered_points', False).value
+        )
+        
         self.bridge = CvBridge()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -411,9 +415,10 @@ class BallDetector(Node):
 
     def _publish(self, filtered: np.ndarray, stamp):
         header = Header(frame_id=self.target_frame, stamp=stamp)
-        self.filtered_points_pub.publish(
-            pc2.create_cloud_xyz32(header, filtered.tolist())
-        )
+        if self.publish_filtered_points:
+            self.filtered_points_pub.publish(
+                pc2.create_cloud_xyz32(header, filtered.tolist())
+            )
         centroid = np.mean(filtered, axis=0)
         ball_pose = PointStamped()
         # Use the cloud's stamp so the predictor sees the actual sensor time.
