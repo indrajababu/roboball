@@ -57,7 +57,7 @@ class HorizontalPopTracker(Node):
         super().__init__('horizontal_pop_tracker')
         self._cb_group = ReentrantCallbackGroup()
 
-        self.control_period = float(self.declare_parameter('control_period', 0.02).value)
+        self.control_period = float(self.declare_parameter('control_period', 0.01).value)
         self.pop_height = min(
             float(self.declare_parameter('pop_height', 12.0 * INCH_TO_M).value),
             60.0 * INCH_TO_M,
@@ -101,7 +101,7 @@ class HorizontalPopTracker(Node):
             int(self.declare_parameter('ticks_per_peak', 12).value)
         )
         self.bounce_lead_time = float(
-            self.declare_parameter('bounce_lead_time', 0.18).value
+            self.declare_parameter('bounce_lead_time', 0.30).value
         )
         self._pop_paddle_velocity = 0.0
         configured_contact_height = float(
