@@ -63,7 +63,26 @@ HOME_POSITIONS = [
     -2.316411157647604,   # shoulder_lift_joint
     -1.810107946395874,  # elbow_joint
     1.0502943235584716,   # wrist_1_joint
-    1.6532617378234867,   # wrist_2_joint
+    2.0732617378234863,   # wrist_2_joint
+    -1.5386202971087855,  # wrist_3_joint
+    5.799105644226074,    # shoulder_pan_joint
+]
+
+HOME_POSITIONS_2 = [
+    -2.316411157647604,   # shoulder_lift_joint
+    -1.810107946395874,  # elbow_joint
+    -0.5205,   # wrist_1_joint
+    0.49920367,   # wrist_2_joint
+    -1.5386202971087855,  # wrist_3_joint
+    5.799105644226074,    # shoulder_pan_joint
+]
+
+
+HOME_POSITIONS_3 = [
+    -2.316411157647604,   # shoulder_lift_joint
+    -1.810107946395874,  # elbow_joint
+    -2.09159,   # wrist_1_joint
+    -1.07159265,   # wrist_2_joint
     -1.5386202971087855,  # wrist_3_joint
     5.799105644226074,    # shoulder_pan_joint
 ]
@@ -99,10 +118,34 @@ class GoHome(Node):
         point.positions = list(HOME_POSITIONS)
         point.velocities = [0.0] * len(HOME_POSITIONS)
         point.accelerations = [0.0] * len(HOME_POSITIONS)
-        point.time_from_start.sec = 0
-        point.time_from_start.nanosec = 300000000
+        point.time_from_start.sec = 1
+        point.time_from_start.nanosec = 0
+        
+        traj = JointTrajectory()
+        traj.header.stamp = self.get_clock().now().to_msg()
+        traj.header.frame_id = "base_link"
+        traj.joint_names = list(HOME_JOINT_NAMES)
+
+
+        point2 = JointTrajectoryPoint()
+        point2.positions = list(HOME_POSITIONS_2)
+        point2.velocities = [0.0] * len(HOME_POSITIONS_2)
+        point2.accelerations = [0.0] * len(HOME_POSITIONS_2)
+        point2.time_from_start.sec = 3
+        point2.time_from_start.nanosec = 0
+
+
+        point3 = JointTrajectoryPoint()
+        point3.positions = list(HOME_POSITIONS_3)
+        point3.velocities = [0.0] * len(HOME_POSITIONS_3)
+        point3.accelerations = [0.0] * len(HOME_POSITIONS_3)
+        point3.time_from_start.sec = 5
+        point3.time_from_start.nanosec = 0
+
 
         traj.points.append(point)
+        traj.points.append(point2)
+        traj.points.append(point3)
 
         self.pub.publish(traj)
 

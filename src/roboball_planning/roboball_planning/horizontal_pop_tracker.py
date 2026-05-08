@@ -60,6 +60,9 @@ class HorizontalPopTracker(Node):
         self.pop_trigger_clearance = float(
             self.declare_parameter('pop_trigger_clearance', 17.5 * INCH_TO_M).value
         )
+        self.pop_duration = float(
+            self.declare_parameter('pop_duration', 0.16).value
+        )
         self.pop_hold_duration = float(
             self.declare_parameter('pop_hold_duration', 0.01).value
         )
@@ -69,6 +72,7 @@ class HorizontalPopTracker(Node):
         self.recovery_duration = float(
             self.declare_parameter('recovery_duration', 0.5).value
         )
+        
         self.pop_rearm_hysteresis = float(
             self.declare_parameter('pop_rearm_hysteresis', 0.02).value
         )
@@ -161,11 +165,15 @@ class HorizontalPopTracker(Node):
         self.joint_state = None
         self.ball_state = None
         self.ball_rx_time = None
+
+        #Adding logging of when we last contacted
+        self.last_contact_time = None
         self._nominal_paddle_z = self.contact_height
         self._locked_tool_quat = None
         self._initial_target_theta = None
         self._last_target_xy = None
         self._state = self.TRACK
+        self.rhythm_tuning = None
         self._pop_start_time = None
         self._recover_start_time = None
         self._pop_armed = True
@@ -227,6 +235,8 @@ class HorizontalPopTracker(Node):
         with self._lock:
             self.ball_state = msg
             self.ball_rx_time = time.monotonic()
+
+            #Add logging for last reached spot
 
     def _control_tick(self):
         if not self._tick_lock.acquire(blocking=False):
@@ -334,6 +344,7 @@ class HorizontalPopTracker(Node):
             current_paddle_z=float(current_paddle_xyz[2]),
             over_ceiling=over_ceiling,
         )
+
         target_paddle_xyz = np.array([
             target_xy[0],
             target_xy[1],
@@ -433,6 +444,7 @@ class HorizontalPopTracker(Node):
         if self._state == self.POP:
             if now_mono - self._pop_start_time >= self.pop_duration:
                 self._state = self.RECOVER
+
                 self._recover_start_time = now_mono
                 self._reset_pid_integrators()
                 self.get_logger().info('POP complete; recovering to locked height.')
@@ -487,6 +499,16 @@ class HorizontalPopTracker(Node):
     def _smooth_bump(self, progress):
         progress = np.clip(float(progress), 0.0, 1.0)
         return np.sin(progress * np.pi)
+
+
+    def reset_to_recover(self):
+        self._state = self.RECOVER
+        self.last_contact_time = time.monotonic()
+
+    def smooth_bump(self, progress):
+        progress = np.clip(float(progress), 0.0, 1.0)
+        return np.sin(progress * np.pi)
+
 
     def _target_paddle_z(self, now_mono, current_paddle_z, over_ceiling=False):
         if over_ceiling:
