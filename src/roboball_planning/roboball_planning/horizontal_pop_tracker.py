@@ -63,6 +63,9 @@ class HorizontalPopTracker(Node):
         self.pop_hold_duration = float(
             self.declare_parameter('pop_hold_duration', 0.01).value
         )
+        self.pop_duration = float(
+            self.declare_parameter('pop_duration', 0.12).value
+        )
         self.recovery_duration = float(
             self.declare_parameter('recovery_duration', 0.5).value
         )
@@ -166,6 +169,7 @@ class HorizontalPopTracker(Node):
         self._pop_start_time = None
         self._recover_start_time = None
         self._pop_armed = True
+        
         self._last_pop_time = -1e9
         self._ceiling_active = False
         self._lock = threading.Lock()
@@ -419,7 +423,7 @@ class HorizontalPopTracker(Node):
             return
 
         if self._state == self.POP:
-            if now_mono - self._pop_start_time >= self.pop_hold_duration:
+            if now_mono - self._pop_start_time >= self.pop_duration:
                 self._state = self.RECOVER
                 self._recover_start_time = now_mono
                 self._reset_pid_integrators()
@@ -434,7 +438,7 @@ class HorizontalPopTracker(Node):
                 self.get_logger().info('Recovery complete; tracking XY at locked height.')
 
     def _finish_pop_state_without_ball(self, now_mono):
-        if self._state == self.POP and now_mono - self._pop_start_time >= self.pop_hold_duration:
+        if self._state == self.POP and now_mono - self._pop_start_time >= self.pop_duration:
             self._state = self.RECOVER
             self._recover_start_time = now_mono
             self._reset_pid_integrators()
@@ -470,6 +474,11 @@ class HorizontalPopTracker(Node):
             self._recover_start_time = now_mono
             self._reset_pid_integrators()
         return True
+    
+
+    def _smooth_bump(self, progress):
+        progress = np.clip(float(progress), 0.0, 1.0)
+        return np.sin(progress * np.pi)
 
     def _target_paddle_z(self, now_mono, current_paddle_z, over_ceiling=False):
         if over_ceiling:
@@ -478,8 +487,15 @@ class HorizontalPopTracker(Node):
         ceiling_z = self._nominal_paddle_z + self.max_vertical_rise
 
         if self._state == self.POP:
+            if self._pop_start_time is None:
+                return self._nominal_paddle_z
+            
+            time_elapsed = now_mono - self._pop_start_time
+            scale = self._smooth_bump(time_elapsed / self.pop_duration)
+
+            time_based_hit = current_paddle_z + self.pop_height * scale
             return min(
-                current_paddle_z + self._pop_paddle_velocity * self.control_period,
+                time_based_hit,
                 ceiling_z,
             )
 
