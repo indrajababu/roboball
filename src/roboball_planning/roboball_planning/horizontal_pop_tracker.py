@@ -97,7 +97,7 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('max_hit_velocity', 3.0).value
         )
         self.ticks_per_peak = float(
-            self.declare_parameter('ticks_per_peak', 9.0).value
+            self.declare_parameter('ticks_per_peak', 4).value
         )
         self._pop_paddle_velocity = 0.0
         configured_contact_height = float(
@@ -188,7 +188,8 @@ class HorizontalPopTracker(Node):
         self._pop_start_time = None
         self._recover_start_time = None
         self._tick_counter = 0
-        self._bounce_high = True
+        self._bounce_high = False
+        self._was_bouncing = False
         self._pop_armed = True
         self._last_pop_time = -1e9
         self._ceiling_active = False
@@ -329,10 +330,40 @@ class HorizontalPopTracker(Node):
         )
 
         target_xy = current_paddle_xyz[:2]
-        ball_clearance = ball_state.position.z - current_paddle_xyz[2]
-        should_bounce = 0.0 <= ball_clearance <= self.pop_trigger_clearance
 
-        """ if self._last_target_xy is not None:
+        should_bounce = False
+
+        if self._last_target_xy is not None:
+            target_xy = self._last_target_xy.copy()
+
+        if ball_valid:
+            ball_pos = np.array([
+                ball_state.position.x,
+                ball_state.position.y,
+                ball_state.position.z,
+            ], dtype=np.float64)
+            ball_vel = np.array([
+                ball_state.velocity.x,
+                ball_state.velocity.y,
+                ball_state.velocity.z,
+            ], dtype=np.float64)
+            target_xy = (
+                ball_pos[:2]
+                - self.ball_to_paddle_offset[:2]
+                - self.ball_to_paddle_offset_margin[:2]
+            )
+            target_xy = _clamp_xy_away_from_body(
+                target_xy,
+                self.min_body_clearance_radius,
+            )
+
+            ball_clearance = ball_state.position.z - current_paddle_xyz[2]
+            should_bounce = 0.0 <= ball_clearance <= self.pop_trigger_clearance
+        else:
+            ball_clearance = float("nan")
+
+        """ 
+        if self._last_target_xy is not None:
             target_xy = self._last_target_xy.copy()
         if ball_valid:
             ball_pos = np.array([
@@ -364,20 +395,25 @@ class HorizontalPopTracker(Node):
             current_paddle_z=float(current_paddle_xyz[2]),
             over_ceiling=over_ceiling,
         ) """
-
+        high_z = min(self._nominal_paddle_z + self.pop_height,
+                     self._nominal_paddle_z + self.max_vertical_rise)
+        
         if should_bounce:
-            self._tick_counter += 1
-            if self._tick_counter >= self.ticks_per_peak:
-                self._bounce_high = not self._bounce_high
+            if not self._was_bouncing:
+                self._was_bouncing = True
+                self._bounc_high = True
                 self._tick_counter = 0
-
-            target_z = (self._nominal_paddle_z + self.pop_height
-                if self._bounce_high
-                else self._nominal_paddle_z
-            )
+            else:
+                self._tick_counter += 1
+                if self._tick_counter >= self.ticks_per_peak:
+                    self._bounce_high = not self._bounce_high
+                    self._tick_counter = 0
+                
+            target_z = high_z if self._bounce_high else self._nominal_paddle_z
         else:
             self._tick_counter = 0
             self._bounce_high = False
+            self._was_bouncing = False
             target_z = self._nominal_paddle_z
         
         # TODO changed so that we no longer move along the xy plane when moving up
@@ -430,7 +466,7 @@ class HorizontalPopTracker(Node):
             return
         target_pos = current_pos + target_delta
         target_vel = np.zeros(6)        
-        active_pid = self.pid_vertical if self._state in (self.POP, self.RECOVER) else self.pid
+        active_pid = self.pid_vertical if should_bounce else self.pid
         cmd = active_pid.step_control(target_pos, target_vel, current_pos, current_vel)
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
         control_ms = (time.perf_counter() - t00) * 1000.0
