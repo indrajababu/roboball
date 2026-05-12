@@ -177,7 +177,7 @@ class HorizontalPopTracker(Node):
         self.joint_state = None
         self.ball_state = None
         self.ball_rx_time = None
-        self._nominal_paddle_z = self.contact_height
+        self._nominal_paddle_z = .3
         self._locked_tool_quat = None
         self._last_target_xy = None
         self._state = self.TRACK
