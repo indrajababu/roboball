@@ -14,7 +14,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from tf2_ros import Buffer, TransformException, TransformListener
-import tf2
+#from tf_transformations import quaternion_about_axis
 from roboball_msgs.msg import BallState
 from roboball_planning.controller import PIDJointVelocityController
 from roboball_planning.ik import IKPlanner
@@ -441,13 +441,14 @@ class HorizontalPopTracker(Node):
             target_z,
         ], dtype=np.float64)
 
-        circle_quat = (-.6532899, .2705776, .6532899, .2705776)
+        circle_quat = circular_quat(
+            self.paraboloid_center, 
+            self.paraboloid_gain, 
+            xy_current_pos=target_paddle_xyz[:2]
+        )
+        #(-.6532899, .2705776, .6532899, .2705776)
         
-        # circular_quat(
-        #     self.paraboloid_center, 
-        #     self.paraboloid_gain, 
-        #     xy_current_pos=target_paddle_xyz[:2]
-        # )
+        
 
         tool_target_xyz = _paddle_to_tool_xyz(
             target_paddle_xyz,
@@ -752,15 +753,28 @@ def circular_quat(xy_paraboloid_center, scr_paraboloid_gain, xy_current_pos):
 
     angle = np.arccos(np.clip(np.dot(default_norm, normal_norm), -1.0, 1.0))
 
-    q = tf2.Quaternion() 
-    
-    axis = axis / np.linalg.norm(axis)
-    q.setRotation(axis, angle)
-
-    quat = (q.x(), q.y(), q.z(), q.w())
+    axis = axis / np.linalg.norm(np.asarray(axis, dtype=float))
+    quat = quaternion_about_axis_np(angle, axis)
 
     return quat
 
+def quaternion_about_axis_np(angle, axis):
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = np.linalg.norm(axis)
+
+    if norm < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+
+    axis = axis / norm
+    half = 0.5 * angle
+    s = np.sin(half)
+
+    return (
+        float(axis[0] * s),
+        float(axis[1] * s),
+        float(axis[2] * s),
+        float(np.cos(half)),
+    )
 
 def _level_paddle_quat(current_quat, paddle_normal_tool):
     """Smallest-rotation correction of current_quat that makes the paddle face
