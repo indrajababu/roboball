@@ -401,17 +401,17 @@ class HorizontalPopTracker(Node):
             active_pid = self.pid
 
             
-            t_now = time.monotonic() - (self.ball_rx_time or time.monotonic())
+            #t_now = time.monotonic() - (self.ball_rx_time or time.monotonic())
 
             #Update the velocity with how much we've update the ball_state, meaning we're assuming bigger jumps in the x/y direction
             #We might need trajectory smoothing as well
-            self.get_logger().info(
-                f"target_xy {target_xy}"
-                f"ball_vel[:2] {ball_vel[:2]}"
-                f"t_now  {t_now }"
-                f"target_xy + ball_vel[:2] * t_now  {target_xy + ball_vel[:2] * t_now }"
-            )
-            target_xy = target_xy + ball_vel[:2] * t_now 
+            # self.get_logger().info(
+            #     f"target_xy {target_xy}"
+            #     f"ball_vel[:2] {ball_vel[:2]}"
+            #     f"t_now  {t_now }"
+            #     f"target_xy + ball_vel[:2] * t_now  {target_xy + ball_vel[:2] * t_now }"
+            # )
+            #target_xy = target_xy + ball_vel[:2] * t_now 
                 
         
         target_xy = (
