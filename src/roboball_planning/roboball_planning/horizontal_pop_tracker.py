@@ -14,7 +14,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from tf2_ros import Buffer, TransformException, TransformListener
-
+import tf2
 from roboball_msgs.msg import BallState
 from roboball_planning.controller import PIDJointVelocityController
 from roboball_planning.ik import IKPlanner
@@ -199,6 +199,10 @@ class HorizontalPopTracker(Node):
         self._pop_armed = True
         self._last_pop_time = -1e9
         self._ceiling_active = False
+
+        self.paraboloid_center = [-0.5, 0.5]
+        self.paraboloid_gain = 0.1
+
         self._lock = threading.Lock()
         self._tick_lock = threading.Lock()
 
@@ -372,7 +376,7 @@ class HorizontalPopTracker(Node):
 
         should_pop_up = falling and (
             0.0 <= ball_clearance <= self.pop_trigger_clearance
-            or 0.03 <= time_to_contact <= self.bounce_lead_time
+            and 0.03 <= time_to_contact <= self.bounce_lead_time
         )
 
         high_z = min(
@@ -437,13 +441,26 @@ class HorizontalPopTracker(Node):
             target_z,
         ], dtype=np.float64)
 
+        circle_quat = (-.6532899, .2705776, .6532899, .2705776)
+        
+        # circular_quat(
+        #     self.paraboloid_center, 
+        #     self.paraboloid_gain, 
+        #     xy_current_pos=target_paddle_xyz[:2]
+        # )
+
         tool_target_xyz = _paddle_to_tool_xyz(
             target_paddle_xyz,
-            self._locked_tool_quat,
+            circle_quat,
             self.paddle_offset_tool0,
         )
         
-        qx, qy, qz, qw = (-.6532899, .2705776, .6532899, .2705776)
+        """NEW CIRCULAR QUAT STUFF"""
+
+        qx, qy, qz, qw = circle_quat
+        #(-.6532899, .2705776, .6532899, .2705776)
+        
+        #seems like we can react fast enough
 
         t0 = time.perf_counter()
         ik_solution = self.ik_planner.compute_ik(
@@ -496,7 +513,7 @@ class HorizontalPopTracker(Node):
             f"control_ms took {control_ms:.1f} ms")
         
         if should_pop_up:
-            t_react = t00 - time.monotonic()
+            t_react = t00 - time.perf_counter()
             self.get_logger().info(
                 f"popping up t_react: {t_react:.1f} ms"
             )
@@ -710,6 +727,39 @@ def _quat_multiply(q1, q2):
         w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
         w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
     )
+
+def circular_quat(xy_paraboloid_center, scr_paraboloid_gain, xy_current_pos):
+    xy = xy_current_pos - xy_paraboloid_center
+    #coordinates of the sphere given the current xy_pos
+
+    normal = np.array([2 * scr_paraboloid_gain * xy[0], 2 * scr_paraboloid_gain * xy[1], -1.0])
+    
+    default_up = np.array([-1.0, 0.0, 0.0])
+
+    away_from_base_link = np.array([xy_current_pos[0], xy_current_pos[1], 0.0])
+
+    if np.dot(normal, away_from_base_link) < 0:
+        normal = -normal
+
+    axis = np.cross(default_up, normal)
+
+    if np.linalg.norm(axis) < 1e-6:
+        #Let the other functions handle the case when we're already at the center
+        return (-.66, .27, .66, .27)
+    
+    default_norm = default_up / np.linalg.norm(default_up)
+    normal_norm = normal / np.linalg.norm(normal)
+
+    angle = np.arccos(np.clip(np.dot(default_norm, normal_norm), -1.0, 1.0))
+
+    q = tf2.Quaternion() 
+    
+    axis = axis / np.linalg.norm(axis)
+    q.setRotation(axis, angle)
+
+    quat = (q.x(), q.y(), q.z(), q.w())
+
+    return quat
 
 
 def _level_paddle_quat(current_quat, paddle_normal_tool):
