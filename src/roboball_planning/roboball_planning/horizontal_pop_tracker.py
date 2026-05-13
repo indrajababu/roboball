@@ -57,7 +57,7 @@ class HorizontalPopTracker(Node):
         super().__init__('horizontal_pop_tracker')
         self._cb_group = ReentrantCallbackGroup()
 
-        self.control_period = float(self.declare_parameter('control_period', 0.02).value)
+        self.control_period = float(self.declare_parameter('control_period', 0.033).value)
         self.pop_height = min(
             float(self.declare_parameter('pop_height', 20 * INCH_TO_M).value),
             60.0 * INCH_TO_M,
@@ -189,6 +189,8 @@ class HorizontalPopTracker(Node):
         self._nominal_paddle_z = 0
         self._locked_tool_quat = (-0.6532899, 0.2705776, 0.6532899, 0.2705776)
         self._last_target_xy = None
+        self.just_popped = False
+
         self._state = self.TRACK
         self._pop_start_time = None
         self._recover_start_time = None
@@ -201,7 +203,7 @@ class HorizontalPopTracker(Node):
         self._ceiling_active = False
 
         self.paraboloid_center = [-0.35, 0.44]
-        self.xyz_center = [-0.44, 0.44, 1000.0]
+        self.xyz_center = [-0.15, 0.47, 10.0]
         self.paraboloid_gain = 0.01
 
         self._lock = threading.Lock()
@@ -392,7 +394,9 @@ class HorizontalPopTracker(Node):
         if should_pop_up:
             target_z = high_z
             active_pid = self.pid_vertical
+            self.just_popped = True
         else:
+            self.just_popped = False
             target_z = self._nominal_paddle_z
             active_pid = self.pid
 
@@ -446,10 +450,14 @@ class HorizontalPopTracker(Node):
             target_z,
         ], dtype=np.float64)
 
+        t1 = time.perf_counter()
         new_quat = self.correct_quat(
             self.xyz_center, 
             xyz_current_pos=current_paddle_xyz,
             xyzw_current_quat=tool_quat
+        )
+        self.get_logger().info(
+            f"time to compute new_quat: {(time.perf_counter() * t1) / 1000} ms"
         )
         #(-.6532899, .2705776, .6532899, .2705776)
         
