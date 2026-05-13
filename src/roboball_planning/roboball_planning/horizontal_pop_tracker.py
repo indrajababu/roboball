@@ -675,9 +675,9 @@ class HorizontalPopTracker(Node):
         desired_normal = xyz_center - xyz_current_pos
 
         # Default normal is [-1.0, 0.0, 0.0]. So negative first column.
-        current_normal =  -_quat_to_rot(*xyzw_current_quat)[0]
+        current_normal =  -_quat_to_rot(*xyzw_current_quat)[:, 0]
 
-        axis = np.cross(desired_normal, current_normal)
+        axis = np.cross(current_normal,desired_normal)
 
         if np.linalg.norm(axis) < 1e-6:
             #Let the other functions handle the case when we're already at the center
@@ -689,9 +689,11 @@ class HorizontalPopTracker(Node):
         angle = np.arccos(np.clip(np.dot(desired_normalized, curr_normalized), -1.0, 1.0))
         axis = axis / np.linalg.norm(np.asarray(axis, dtype=float))
 
-        quat = quaternion_about_axis_np(angle, axis)
+        correction_quat = quaternion_about_axis_np(angle, axis)
 
-        return quat
+        final_quat = _quat_multiply(correction_quat, xyzw_current_quat)
+
+        return final_quat
 
 
 def _reorder_positions(joint_state, order):
