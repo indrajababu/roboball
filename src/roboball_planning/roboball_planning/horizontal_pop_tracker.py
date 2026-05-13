@@ -200,8 +200,9 @@ class HorizontalPopTracker(Node):
         self._last_pop_time = -1e9
         self._ceiling_active = False
 
-        self.paraboloid_center = [-0.5, 0.5]
-        self.paraboloid_gain = 0.1
+        self.paraboloid_center = [-0.35, 0.44]
+        self.xyz_center = [-0.44, 0.44, 1000.0]
+        self.paraboloid_gain = 0.01
 
         self._lock = threading.Lock()
         self._tick_lock = threading.Lock()
@@ -304,6 +305,10 @@ class HorizontalPopTracker(Node):
             tool_quat,
             self.paddle_offset_tool0,
         )
+
+        self.get_logger().info(
+                f"tool_xyz: {tool_xyz}"
+            )
 
         if self._locked_tool_quat is None:
             self._locked_tool_quat = tool_quat
@@ -441,24 +446,29 @@ class HorizontalPopTracker(Node):
             target_z,
         ], dtype=np.float64)
 
-        circle_quat = circular_quat(
-            self.paraboloid_center, 
-            self.paraboloid_gain, 
-            xy_current_pos=target_paddle_xyz[:2]
+        new_quat = self.correct_quat(
+            self.xyz_center, 
+            xyz_current_pos=current_paddle_xyz,
+            xyzw_current_quat=tool_quat
         )
         #(-.6532899, .2705776, .6532899, .2705776)
         
-        
+        # new_quat = _quat_multiply(self._locked_tool_quat, circle_quat)
+
+        self.get_logger().info(
+            f"circle_quat {tool_quat}"
+            f"new_quat {new_quat}"
+        )
 
         tool_target_xyz = _paddle_to_tool_xyz(
             target_paddle_xyz,
-            circle_quat,
+            new_quat,
             self.paddle_offset_tool0,
         )
         
         """NEW CIRCULAR QUAT STUFF"""
 
-        qx, qy, qz, qw = circle_quat
+        qx, qy, qz, qw = new_quat
         #(-.6532899, .2705776, .6532899, .2705776)
         
         #seems like we can react fast enough
@@ -660,6 +670,29 @@ class HorizontalPopTracker(Node):
             deactivate='forward_velocity_controller',
         )
 
+    
+    def correct_quat(self, xyz_center, xyz_current_pos, xyzw_current_quat):
+        desired_normal = xyz_center - xyz_current_pos
+
+        # Default normal is [-1.0, 0.0, 0.0]. So negative first column.
+        current_normal =  -_quat_to_rot(*xyzw_current_quat)[0]
+
+        axis = np.cross(desired_normal, current_normal)
+
+        if np.linalg.norm(axis) < 1e-6:
+            #Let the other functions handle the case when we're already at the center
+            return (-.66, .27, .66, .27)
+        
+        desired_normalized = desired_normal / np.linalg.norm(desired_normal)
+        curr_normalized = current_normal / np.linalg.norm(current_normal)
+
+        angle = np.arccos(np.clip(np.dot(desired_normalized, curr_normalized), -1.0, 1.0))
+        axis = axis / np.linalg.norm(np.asarray(axis, dtype=float))
+
+        quat = quaternion_about_axis_np(angle, axis)
+
+        return quat
+
 
 def _reorder_positions(joint_state, order):
     name_to_pos = dict(zip(joint_state.name, joint_state.position))
@@ -729,11 +762,19 @@ def _quat_multiply(q1, q2):
         w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
     )
 
+def quat_from_two_angles(angle1, angle2):
+    quat1 = _quat_to_rot()
+
+
+def combine_quats(circular_quat, default_quat):
+    return
+
+
 def circular_quat(xy_paraboloid_center, scr_paraboloid_gain, xy_current_pos):
     xy = xy_current_pos - xy_paraboloid_center
     #coordinates of the sphere given the current xy_pos
 
-    normal = np.array([2 * scr_paraboloid_gain * xy[0], 2 * scr_paraboloid_gain * xy[1], -1.0])
+    normal = np.array([-2 * scr_paraboloid_gain * xy[0], -2 * scr_paraboloid_gain * xy[1], 1.0])
     
     default_up = np.array([-1.0, 0.0, 0.0])
 
@@ -757,6 +798,8 @@ def circular_quat(xy_paraboloid_center, scr_paraboloid_gain, xy_current_pos):
     quat = quaternion_about_axis_np(angle, axis)
 
     return quat
+
+
 
 def quaternion_about_axis_np(angle, axis):
     axis = np.asarray(axis, dtype=np.float64)
