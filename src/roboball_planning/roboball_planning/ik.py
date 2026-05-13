@@ -95,7 +95,7 @@ class IKPlanner(Node):
             )
             return None
 
-        self.get_logger().info('IK solution found.')
+        #self.get_logger().info('IK solution found.')
         return result.solution.joint_state
 
     # -----------------------------------------------------------

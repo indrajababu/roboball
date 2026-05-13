@@ -57,7 +57,7 @@ class HorizontalPopTracker(Node):
         super().__init__('horizontal_pop_tracker')
         self._cb_group = ReentrantCallbackGroup()
 
-        self.control_period = float(self.declare_parameter('control_period', 0.0333).value)
+        self.control_period = float(self.declare_parameter('control_period', 0.02).value)
         self.pop_height = min(
             float(self.declare_parameter('pop_height', 20 * INCH_TO_M).value),
             60.0 * INCH_TO_M,
@@ -67,7 +67,7 @@ class HorizontalPopTracker(Node):
             60.0 * INCH_TO_M,
         )
         self.pop_trigger_clearance = float(
-            self.declare_parameter('pop_trigger_clearance', 30 * INCH_TO_M).value
+            self.declare_parameter('pop_trigger_clearance', 36 * INCH_TO_M).value
         )
         self.pop_hold_duration = float(
             self.declare_parameter('pop_hold_duration', 0.12).value
@@ -101,7 +101,7 @@ class HorizontalPopTracker(Node):
             int(self.declare_parameter('ticks_per_peak', 12).value)
         )
         self.bounce_lead_time = float(
-            self.declare_parameter('bounce_lead_time', 0.18).value
+            self.declare_parameter('bounce_lead_time', 0.33).value
         )
         self._pop_paddle_velocity = 0.0
         configured_contact_height = float(
@@ -113,12 +113,12 @@ class HorizontalPopTracker(Node):
             else None
         )
         self.min_body_clearance_radius = float(
-            self.declare_parameter('min_body_clearance_radius', 0.30).value
+            self.declare_parameter('min_body_clearance_radius', 1.5).value
         )
         self.ball_timeout = float(self.declare_parameter('ball_timeout', 0.35).value)
         self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.02).value)
         self.max_joint_speed = float(
-            self.declare_parameter('max_joint_speed', 2.0).value
+            self.declare_parameter('max_joint_speed', 2.5).value
         )
         self.max_ik_joint_delta = float(
             self.declare_parameter('max_ik_joint_delta', np.pi / 4.0).value
@@ -171,7 +171,7 @@ class HorizontalPopTracker(Node):
         )
         self.pid_vertical = PIDJointVelocityController(
             self,
-            7 * np.array([0.5, 1.5, 1.5, 1.0, 1.0, 1.0]), #positive direction brings 
+            10 * np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0]), #positive direction brings 
             #ee up in all cases! for joints 1-3
             Ki,
             Kd,
@@ -269,7 +269,7 @@ class HorizontalPopTracker(Node):
         with self._lock:
             joint_state = self.joint_state
             ball_state = self.ball_state
-            ball_rx_time = self.ball_rx_time
+            ball_rx_time = self.ball_rx_time or time.monotonic()
 
         if joint_state is None:
             return
@@ -379,7 +379,7 @@ class HorizontalPopTracker(Node):
             self._nominal_paddle_z + self.pop_height,
             self._nominal_paddle_z + self.max_vertical_rise,
         )
-
+        
         if should_pop_up:
             target_z = high_z
             active_pid = self.pid_vertical
@@ -387,11 +387,12 @@ class HorizontalPopTracker(Node):
             target_z = self._nominal_paddle_z
             active_pid = self.pid
 
-            t_now = time.monotonic() - self.ball_rx_time
+            
+            t_now = time.monotonic() - (self.ball_rx_time or time.monotonic())
 
             #Update the velocity with how much we've update the ball_state, meaning we're assuming bigger jumps in the x/y direction
             #We might need trajectory smoothing as well
-            target_xy = target_xy + ball_vel[:2] * t_now 
+            # target_xy = target_xy + ball_vel[:2] * t_now 
                 
         
         target_xy = (
@@ -490,10 +491,15 @@ class HorizontalPopTracker(Node):
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
         control_ms = (time.perf_counter() - t00) * 1000.0
 
-        if self._time_log:
+        self.get_logger().info(
+            f"should_pop_up {should_pop_up}"
+            f"control_ms took {control_ms:.1f} ms")
+        
+        if should_pop_up:
+            t_react = t00 - time.monotonic()
             self.get_logger().info(
-            f"control_ms took {control_ms:.1f} ms"
-        )
+                f"popping up t_react: {t_react:.1f} ms"
+            )
 
         self._publish_velocity(cmd)
 
@@ -750,7 +756,7 @@ def _level_paddle_quat(current_quat, paddle_normal_tool):
 def main(args=None):
     rclpy.init(args=args)
     node = HorizontalPopTracker()
-    executor = MultiThreadedExecutor(num_threads=2)
+    executor = MultiThreadedExecutor(num_threads=1)
     executor.add_node(node)
     try:
         executor.spin()
