@@ -116,7 +116,7 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('min_body_clearance_radius', 1.5).value
         )
         self.ball_timeout = float(self.declare_parameter('ball_timeout', 0.35).value)
-        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.02).value)
+        self.ik_timeout = float(self.declare_parameter('ik_timeout', 0.0012).value)
         self.max_joint_speed = float(
             self.declare_parameter('max_joint_speed', 2.5).value
         )
@@ -203,7 +203,7 @@ class HorizontalPopTracker(Node):
         self._ceiling_active = False
 
         self.paraboloid_center = [-0.35, 0.44]
-        self.xyz_center = [-0.15, 0.47, 10.0]
+        self.xyz_center = [-0.5, 0.57, 10.0]
         self.paraboloid_gain = 0.01
 
         self._lock = threading.Lock()
@@ -405,7 +405,13 @@ class HorizontalPopTracker(Node):
 
             #Update the velocity with how much we've update the ball_state, meaning we're assuming bigger jumps in the x/y direction
             #We might need trajectory smoothing as well
-            # target_xy = target_xy + ball_vel[:2] * t_now 
+            self.get_logger().info(
+                f"target_xy {target_xy}"
+                f"ball_vel[:2] {ball_vel[:2]}"
+                f"t_now  {t_now }"
+                f"target_xy + ball_vel[:2] * t_now  {target_xy + ball_vel[:2] * t_now }"
+            )
+            target_xy = target_xy + ball_vel[:2] * t_now 
                 
         
         target_xy = (
@@ -453,11 +459,11 @@ class HorizontalPopTracker(Node):
         t1 = time.perf_counter()
         new_quat = self.correct_quat(
             self.xyz_center, 
-            xyz_current_pos=current_paddle_xyz,
+            xyz_current_pos=target_paddle_xyz,
             xyzw_current_quat=tool_quat
         )
         self.get_logger().info(
-            f"time to compute new_quat: {(time.perf_counter() * t1) / 1000} ms"
+            f"time to compute new_quat: {(time.perf_counter() - t1) / 1000} ms"
         )
         #(-.6532899, .2705776, .6532899, .2705776)
         
