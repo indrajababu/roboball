@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'static_camera_tf = roboball_bringup.static_camera_tf:main',
             'go_home = roboball_bringup.go_home:main',
+            'shift_right = roboball_bringup.shift_right:main',
         ],
     },
 )

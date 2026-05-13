@@ -38,7 +38,7 @@ DEFAULT_BALL_TO_PADDLE_OFFSET = [-0.082, 0.094, 0.116]
 # Pure 90° rotation about base_link y. With the paddle mounted square on tool0,
 # this puts the paddle face normal exactly along base_link +z (perfectly
 # horizontal). (qx, qy, qz, qw).
-HORIZONTAL_TOOL_QUAT = (0.0, float(np.sqrt(0.5)), 0.0, float(np.sqrt(0.5)))
+HORIZONTAL_TOOL_QUAT = (0.0, -1.0, 0.0, 0.0)
 # Direction of the paddle face normal expressed in tool0 frame. With the
 # calibrated horizontal quaternion (≈90° about base_y), tool -x maps to base
 # +z, so the paddle face must be normal to tool -x. Override via parameter if
@@ -57,7 +57,7 @@ class HorizontalPopTracker(Node):
         super().__init__('horizontal_pop_tracker')
         self._cb_group = ReentrantCallbackGroup()
 
-        self.control_period = float(self.declare_parameter('control_period', 0.02).value)
+        self.control_period = float(self.declare_parameter('control_period', 0.0333).value)
         self.pop_height = min(
             float(self.declare_parameter('pop_height', 20 * INCH_TO_M).value),
             60.0 * INCH_TO_M,
@@ -85,7 +85,7 @@ class HorizontalPopTracker(Node):
             self.declare_parameter('min_pop_interval', 0.10).value
         )
         self.descending_velocity_threshold = float(
-            self.declare_parameter('descending_velocity_threshold', -0.035).value
+            self.declare_parameter('descending_velocity_threshold', -0.02).value
         )
         self.hit_velocity_gain = float(
             self.declare_parameter('hit_velocity_gain', 2).value
@@ -171,7 +171,7 @@ class HorizontalPopTracker(Node):
         )
         self.pid_vertical = PIDJointVelocityController(
             self,
-            13 * np.array([0.5, 1.5, 1.5, 1.0, 1.0, 1.0]), #positive direction brings 
+            7 * np.array([0.5, 1.5, 1.5, 1.0, 1.0, 1.0]), #positive direction brings 
             #ee up in all cases! for joints 1-3
             Ki,
             Kd,
@@ -186,8 +186,8 @@ class HorizontalPopTracker(Node):
         self.joint_state = None
         self.ball_state = None
         self.ball_rx_time = None
-        self._nominal_paddle_z = self.contact_height
-        self._locked_tool_quat = None #(0, 0, 0, 1)
+        self._nominal_paddle_z = 0
+        self._locked_tool_quat = (-0.6532899, 0.2705776, 0.6532899, 0.2705776)
         self._last_target_xy = None
         self._state = self.TRACK
         self._pop_start_time = None
@@ -310,17 +310,22 @@ class HorizontalPopTracker(Node):
             self.get_logger().info(
                 f'Locked paddle height at {self._nominal_paddle_z:.3f}m.'
             )
-        if self._locked_tool_quat is None:
+        if False:
             leveled, swing_angle = _level_paddle_quat(
                 tool_quat,
                 self.paddle_normal_tool0,
             )
-            self._locked_tool_quat = leveled
-            self.get_logger().info(
-                f'Locked paddle-leveled tool quat=({leveled[0]:.4f}, '
-                f'{leveled[1]:.4f}, {leveled[2]:.4f}, {leveled[3]:.4f}). '
-                f'Swing from current = {np.degrees(swing_angle):.2f} deg.'
-            )
+            if self._time_log:
+                self._locked_tool_quat = leveled
+                self.get_logger().info(
+                    f'Locked paddle-leveled tool quat=({leveled[0]:.4f}, '
+                    f'{leveled[1]:.4f}, {leveled[2]:.4f}, {leveled[3]:.4f}). '
+                    f'Swing from current = {np.degrees(swing_angle):.2f} deg.'
+                )
+                self.get_logger().info(
+                    f"tool_quat: {tool_quat}"
+                    f"\n self._locked_tool_quat: {self._locked_tool_quat }"
+                )
 
         now_mono = time.monotonic()
 
@@ -332,6 +337,7 @@ class HorizontalPopTracker(Node):
         )
 
         target_xy = current_paddle_xyz[:2]
+        ball_vel = np.zeros(3)
 
         if self._last_target_xy is not None:
             target_xy = self._last_target_xy.copy()
@@ -348,16 +354,9 @@ class HorizontalPopTracker(Node):
                 ball_state.velocity.y,
                 ball_state.velocity.z,
             ], dtype=np.float64)
-            target_xy = (
-                ball_pos[:2]
-                - self.ball_to_paddle_offset[:2]
-                - self.ball_to_paddle_offset_margin[:2]
-            )
-            target_xy = _clamp_xy_away_from_body(
-                target_xy,
-                self.min_body_clearance_radius,
-            )
-            self._last_target_xy = target_xy.copy()
+
+            target_xy = ball_pos[:2]
+           
             ball_clearance = float(ball_state.position.z - self._nominal_paddle_z)
             vz = float(ball_state.velocity.z)
         else:
@@ -387,7 +386,24 @@ class HorizontalPopTracker(Node):
         else:
             target_z = self._nominal_paddle_z
             active_pid = self.pid
+
+            t_now = time.monotonic() - self.ball_rx_time
+
+            #Update the velocity with how much we've update the ball_state, meaning we're assuming bigger jumps in the x/y direction
+            #We might need trajectory smoothing as well
+            target_xy = target_xy + ball_vel[:2] * t_now 
+                
         
+        target_xy = (
+                target_xy
+                - self.ball_to_paddle_offset[:2]
+                - self.ball_to_paddle_offset_margin[:2]
+            )
+        target_xy = _clamp_xy_away_from_body(
+                target_xy,
+                self.min_body_clearance_radius,
+            )
+        self._last_target_xy = target_xy.copy()
         """ 
         high_z = min(self._nominal_paddle_z + self.pop_height,
                      self._nominal_paddle_z + self.max_vertical_rise)
@@ -425,7 +441,9 @@ class HorizontalPopTracker(Node):
             self._locked_tool_quat,
             self.paddle_offset_tool0,
         )
-        qx, qy, qz, qw = self._locked_tool_quat
+        
+        qx, qy, qz, qw = (-.6532899, .2705776, .6532899, .2705776)
+
         t0 = time.perf_counter()
         ik_solution = self.ik_planner.compute_ik(
             joint_state,
@@ -440,6 +458,9 @@ class HorizontalPopTracker(Node):
             timeout_sec=self.ik_timeout,
         )
         if ik_solution is None:
+            self.get_logger().info(
+                f"no ik solution: publishing zero's to the forward_velocity_controller/commands"
+            )
             self._publish_velocity(np.zeros(6))
             return
         ik_ms = (time.perf_counter() - t0) * 1000.0
@@ -447,6 +468,7 @@ class HorizontalPopTracker(Node):
             self.get_logger().info(
                 f"ik_ms took {ik_ms:.1f} ms"
             )
+
 
         current_pos, current_vel = _current_joint_vector(joint_state, JOINT_ORDER)
         target_pos = _reorder_positions(ik_solution, JOINT_ORDER)
@@ -722,6 +744,7 @@ def _level_paddle_quat(current_quat, paddle_normal_tool):
     if norm > 1e-12:
         leveled = tuple(c / norm for c in leveled)
     return leveled, angle
+
 
 
 def main(args=None):
