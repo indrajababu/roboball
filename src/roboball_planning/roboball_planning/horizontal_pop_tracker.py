@@ -321,22 +321,6 @@ class HorizontalPopTracker(Node):
             self.get_logger().info(
                 f'Locked paddle height at {self._nominal_paddle_z:.3f}m.'
             )
-        if False:
-            leveled, swing_angle = _level_paddle_quat(
-                tool_quat,
-                self.paddle_normal_tool0,
-            )
-            if self._time_log:
-                self._locked_tool_quat = leveled
-                self.get_logger().info(
-                    f'Locked paddle-leveled tool quat=({leveled[0]:.4f}, '
-                    f'{leveled[1]:.4f}, {leveled[2]:.4f}, {leveled[3]:.4f}). '
-                    f'Swing from current = {np.degrees(swing_angle):.2f} deg.'
-                )
-                self.get_logger().info(
-                    f"tool_quat: {tool_quat}"
-                    f"\n self._locked_tool_quat: {self._locked_tool_quat }"
-                )
 
         now_mono = time.monotonic()
 
@@ -545,110 +529,10 @@ class HorizontalPopTracker(Node):
 
         self._publish_velocity(cmd)
 
-    def _update_pop_state(self, now_mono, ball_pos, ball_vel):
-        ball_vel_z = float(ball_vel[2])
-        ball_clearance = float(ball_pos[2] - self._nominal_paddle_z)
-        
-        if not self._pop_armed:
-            rearm_clearance = self.pop_trigger_clearance + self.pop_rearm_hysteresis
-            if ball_clearance >= rearm_clearance:
-                self._pop_armed = True
-                self.get_logger().info(
-                    f'POP re-armed: ball_clearance={ball_clearance:.3f}m.'
-                )
-
-        if self._state == self.TRACK:
-            #Let's change this so that we trigger by speed
-
-            ready_by_height = ball_clearance <= self.pop_trigger_clearance
-            ready_by_velocity = ball_vel_z <= self.descending_velocity_threshold
-            ready_by_time = now_mono - self._last_pop_time >= self.min_pop_interval
-
-            if ready_by_height:
-                incoming_speed = max(0.0, -ball_vel_z)
-                self._pop_paddle_velocity = float(np.clip(
-                    self.hit_velocity_gain * incoming_speed,
-                    self.min_hit_velocity,
-                    self.max_hit_velocity,
-                ))
-                self._state = self.POP
-                self._pop_start_time = now_mono
-                self._pop_armed = False
-                self._last_pop_time = now_mono
-                self._reset_pid_integrators()
-                self.get_logger().info(
-                    f'POP start: ball_clearance={ball_clearance:.3f}m, '
-                    f'ball_vel_z={ball_vel_z:.3f}m/s, '
-                    f'pop_paddle_velocity={self._pop_paddle_velocity:.3f}m/s.'
-                )
-            return
-
-        if self._state == self.POP:
-            if now_mono - self._pop_start_time >= self.pop_hold_duration:
-                self._state = self.RECOVER
-                self._recover_start_time = now_mono
-                self._reset_pid_integrators()
-                self.get_logger().info('POP complete; recovering to locked height.')
-            return
-
-        if self._state == self.RECOVER:
-            if now_mono - self._recover_start_time >= self.recovery_duration:
-                self._state = self.TRACK
-                self._recover_start_time = None
-                self._reset_pid_integrators()
-                self.get_logger().info('Recovery complete; tracking XY at locked height.')
-
-    def _finish_pop_state_without_ball(self, now_mono):
-        if self._state == self.POP and now_mono - self._pop_start_time >= self.pop_hold_duration:
-            self._state = self.RECOVER
-            self._recover_start_time = now_mono
-            self._reset_pid_integrators()
-        elif (
-            self._state == self.RECOVER
-            and now_mono - self._recover_start_time >= self.recovery_duration
-        ):
-            self._state = self.TRACK
-            self._recover_start_time = None
-            self._reset_pid_integrators()
-
     def _reset_pid_integrators(self):
         self.pid.integral_error = np.zeros(6)
         self.pid_vertical.integral_error = np.zeros(6)
 
-
-    def _enforce_vertical_ceiling(self, now_mono, current_paddle_z):
-        ceiling_z = self._nominal_paddle_z + self.max_vertical_rise
-        if current_paddle_z < ceiling_z:
-            self._ceiling_active = False
-            return False
-
-        if not self._ceiling_active:
-            self.get_logger().warn(
-                f'Vertical ceiling hit: paddle_z={current_paddle_z:.3f}m '
-                f'>= ceiling_z={ceiling_z:.3f}m. Forcing recovery to '
-                f'{self._nominal_paddle_z:.3f}m.',
-                throttle_duration_sec=0.5,
-            )
-        self._ceiling_active = True
-        if self._state != self.RECOVER:
-            self._state = self.RECOVER
-            self._recover_start_time = now_mono
-            self._reset_pid_integrators()
-        return True
-
-    def _target_paddle_z(self, now_mono, current_paddle_z, over_ceiling=False):
-        if over_ceiling:
-            return self._nominal_paddle_z
-
-        ceiling_z = self._nominal_paddle_z + self.max_vertical_rise
-
-        #if self._state == self.POP:
-        return min(
-                current_paddle_z + self._pop_paddle_velocity * self.control_period * 1.5,
-                ceiling_z,
-            )
-
-        #return self._nominal_paddle_z
 
     def _publish_velocity(self, cmd):
         msg = Float64MultiArray()
@@ -778,14 +662,6 @@ def _quat_multiply(q1, q2):
         w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
     )
 
-def quat_from_two_angles(angle1, angle2):
-    quat1 = _quat_to_rot()
-
-
-def combine_quats(circular_quat, default_quat):
-    return
-
-
 def circular_quat(xy_paraboloid_center, scr_paraboloid_gain, xy_current_pos):
     xy = xy_current_pos - xy_paraboloid_center
     #coordinates of the sphere given the current xy_pos
@@ -834,46 +710,6 @@ def quaternion_about_axis_np(angle, axis):
         float(axis[2] * s),
         float(np.cos(half)),
     )
-
-def _level_paddle_quat(current_quat, paddle_normal_tool):
-    """Smallest-rotation correction of current_quat that makes the paddle face
-    normal point along base_link +z.
-
-    Decomposes the rotation into swing (around an axis perpendicular to the
-    face normal) and twist (around the face normal). We zero out the swing
-    needed to bring the face normal to vertical and leave the twist of the
-    current orientation untouched. Returns (leveled_quat, swing_angle_rad).
-    """
-    n_tool = np.asarray(paddle_normal_tool, dtype=np.float64)
-    n_tool = n_tool / max(float(np.linalg.norm(n_tool)), 1e-12)
-    R = _quat_to_rot(*current_quat)
-    n_base = R @ n_tool
-    n_base /= max(float(np.linalg.norm(n_base)), 1e-12)
-    target = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    cos_a = float(np.clip(np.dot(n_base, target), -1.0, 1.0))
-    axis = np.cross(n_base, target)
-    sin_a = float(np.linalg.norm(axis))
-    if sin_a < 1e-9:
-        if cos_a > 0.0:
-            return tuple(float(v) for v in current_quat), 0.0
-        # 180° flip — pick any axis perpendicular to n_base.
-        seed = np.array([1.0, 0.0, 0.0]) if abs(n_base[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        axis = seed - n_base * float(np.dot(seed, n_base))
-        axis /= max(float(np.linalg.norm(axis)), 1e-12)
-        sin_a = 1.0
-        cos_a = -1.0
-    else:
-        axis /= sin_a
-    angle = float(np.arctan2(sin_a, cos_a))
-    half = 0.5 * angle
-    s = float(np.sin(half))
-    correction = (axis[0] * s, axis[1] * s, axis[2] * s, float(np.cos(half)))
-    leveled = _quat_multiply(correction, current_quat)
-    norm = float(np.sqrt(sum(c * c for c in leveled)))
-    if norm > 1e-12:
-        leveled = tuple(c / norm for c in leveled)
-    return leveled, angle
-
 
 
 def main(args=None):
