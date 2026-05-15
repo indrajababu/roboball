@@ -159,8 +159,8 @@ class HorizontalPopTracker(Node):
             self.paddle_normal_tool0 /= n_norm
 
         Kp = 2 * np.array([3.0, 2.0, 2.0, 2.0, 3.0, 2.0])
-        Kd = 0.01 * np.array([2.0, 1.0, 2.0, 0.5, 0.8, 0.8])
-        Ki = 0.01 * np.array([1.4, 1.4, 1.4, 1.0, 0.6, 0.6])
+        Kd = 0.2 * np.array([2.0, 1.0, 2.0, 0.5, 0.8, 0.8])
+        Ki = 0.1 * np.array([1.4, 1.4, 1.4, 1.0, 0.6, 0.6])
         self.pid = PIDJointVelocityController(
             self,
             Kp,
