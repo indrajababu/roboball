@@ -324,18 +324,21 @@ class HorizontalPopTracker(Node):
             self._nominal_paddle_z + self.max_vertical_rise,
         )
 
-        if should_pop_up:
-            if self._was_bouncing:
-                self._tick_counter += 1
-                if self._tick_counter > self.ticks_per_peak:
-                    self._was_bouncing = False
-                    self._tick_counter = 0
+        if should_pop_up and not self._was_bouncing:
+            self._was_bouncing = True
+            self._tick_counter = 0
+
+        if self._was_bouncing:
+            self._tick_counter += 1
+            if self._tick_counter <= self.ticks_per_peak:
                 target_z = high_z
                 active_pid = self.pid_vertical
             else:
-                target_z = high_z
-                active_pid = self.pid_vertical
-                self._was_bouncing = True
+                target_z = self._nominal_paddle_z
+                active_pid = self.pid
+                if not should_pop_up:
+                    self._was_bouncing = False
+                    self._tick_counter = 0
         else:
             target_z = self._nominal_paddle_z
             active_pid = self.pid
