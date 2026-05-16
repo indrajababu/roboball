@@ -69,32 +69,8 @@ class HorizontalPopTracker(Node):
         self.pop_trigger_clearance = float(
             self.declare_parameter('pop_trigger_clearance', 36 * INCH_TO_M).value
         )
-        self.pop_hold_duration = float(
-            self.declare_parameter('pop_hold_duration', 0.12).value
-        )
-        self.recovery_duration = float(
-            self.declare_parameter('recovery_duration', 0.5).value
-        )
-        self.pop_rearm_hysteresis = float(
-            self.declare_parameter('pop_rearm_hysteresis', 0.02).value
-        )
-        self.lock_contact_height = bool(
-            self.declare_parameter('lock_contact_height', True).value
-        )
-        self.min_pop_interval = float(
-            self.declare_parameter('min_pop_interval', 0.10).value
-        )
         self.descending_velocity_threshold = float(
             self.declare_parameter('descending_velocity_threshold', -0.02).value
-        )
-        self.hit_velocity_gain = float(
-            self.declare_parameter('hit_velocity_gain', 2).value
-        )
-        self.min_hit_velocity = float(
-            self.declare_parameter('min_hit_velocity', 0.05).value
-        )
-        self.max_hit_velocity = float(
-            self.declare_parameter('max_hit_velocity', 3.0).value
         )
         self.ticks_per_peak = max(
             1,
@@ -187,19 +163,13 @@ class HorizontalPopTracker(Node):
         self.ball_rx_time = None
         self._nominal_paddle_z = self.contact_height
         self._locked_tool_quat = None #(0, 0, 0, 1)
+        self.xyz_center = [-0.5, 0.57, 10.0]
         self._last_target_xy = None
-        self._state = self.TRACK
-        self._pop_start_time = None
-        self._recover_start_time = None
         self._tick_counter = 0
-        self._bounce_high = False
         self._was_bouncing = False
-        self._bounce_xy = None
-        self._pop_armed = True
-        self._last_pop_time = -1e9
-        self._ceiling_active = False
         self._lock = threading.Lock()
         self._tick_lock = threading.Lock()
+        self.active_pid = None
 
         self.create_subscription(
             JointState,
@@ -235,10 +205,6 @@ class HorizontalPopTracker(Node):
             f'Horizontal pop tracker up. pop_height={self.pop_height:.3f}m, '
             f'max_vertical_rise={self.max_vertical_rise:.3f}m, '
             f'pop_trigger_clearance={self.pop_trigger_clearance:.3f}m, '
-            f'pop_hold_duration={self.pop_hold_duration:.3f}s, '
-            f'recovery_duration={self.recovery_duration:.3f}s, '
-            f'lock_contact_height={self.lock_contact_height}, '
-            f'contact_height={self.contact_height}, '
             f'min_body_clearance_radius={self.min_body_clearance_radius:.3f}m, '
             f'max_joint_speed={self.max_joint_speed:.3f}rad/s, '
             f'max_ik_joint_delta={self.max_ik_joint_delta:.3f}rad. '
@@ -303,24 +269,6 @@ class HorizontalPopTracker(Node):
         if self._locked_tool_quat is None:
             self._locked_tool_quat = tool_quat
 
-        
-        if self._nominal_paddle_z is None:
-            self._nominal_paddle_z = float(current_paddle_xyz[2])
-            self.get_logger().info(
-                f'Locked paddle height at {self._nominal_paddle_z:.3f}m.'
-            )
-        if self._locked_tool_quat is None:
-            leveled, swing_angle = _level_paddle_quat(
-                tool_quat,
-                self.paddle_normal_tool0,
-            )
-            self._locked_tool_quat = leveled
-            self.get_logger().info(
-                f'Locked paddle-leveled tool quat=({leveled[0]:.4f}, '
-                f'{leveled[1]:.4f}, {leveled[2]:.4f}, {leveled[3]:.4f}). '
-                f'Swing from current = {np.degrees(swing_angle):.2f} deg.'
-            )
-
         now_mono = time.monotonic()
 
         ball_valid = (
@@ -381,38 +329,21 @@ class HorizontalPopTracker(Node):
         )
 
         if should_pop_up:
-            target_z = high_z
-            active_pid = self.pid_vertical
+            if self._was_bouncing:
+                self._tick_counter += 1
+                if self._tick_counter > self.ticks_per_peak:
+                    self._was_bouncing = False
+                    self._tick_counter = 0
+                target_z = high_z
+                active_pid = self.pid_vertical
+            else:
+                target_z = high_z
+                active_pid = self.pid_vertical
+                self._was_bouncing = True
         else:
             target_z = self._nominal_paddle_z
             active_pid = self.pid
         
-        """ 
-        high_z = min(self._nominal_paddle_z + self.pop_height,
-                     self._nominal_paddle_z + self.max_vertical_rise)
-        
-        if should_bounce:
-            if not self._was_bouncing:
-                self._was_bouncing = True
-                self._bounce_high = True
-                self._tick_counter = 0
-                self._bounce_xy = current_paddle_xyz[:2].copy()
-                # or use target_xy.copy() if you want to jump to target then freeze
-            else:
-                self._tick_counter += 1
-                if self._tick_counter >= self.ticks_per_peak:
-                    self._bounce_high = not self._bounce_high
-                    self._tick_counter = 0
-            
-            target_xy = self._bounce_xy.copy()
-            target_z = high_z if self._bounce_high else self._nominal_paddle_z
-        else:
-            self._tick_counter = 0
-            self._bounce_high = False
-            self._was_bouncing = False
-            target_z = self._nominal_paddle_z """
-        
-        # TODO changed so that we no longer move along the xy plane when moving up
         target_paddle_xyz = np.array([
             target_xy[0],
             target_xy[1],
@@ -424,7 +355,13 @@ class HorizontalPopTracker(Node):
             self._locked_tool_quat,
             self.paddle_offset_tool0,
         )
-        qx, qy, qz, qw = self._locked_tool_quat
+
+        qx, qy, qz, qw = self.correct_quat(
+            self.xyz_center, 
+            xyz_current_pos=target_paddle_xyz,
+            xyzw_current_quat=tool_quat
+        )
+
         t0 = time.perf_counter()
         ik_solution = self.ik_planner.compute_ik(
             joint_state,
@@ -461,8 +398,7 @@ class HorizontalPopTracker(Node):
             self._publish_velocity(np.zeros(6))
             return
         target_pos = current_pos + target_delta
-        target_vel = np.zeros(6)        
-        active_pid = self.pid_vertical if should_bounce else self.pid
+        target_vel = np.zeros(6)
         cmd = active_pid.step_control(target_pos, target_vel, current_pos, current_vel)
         cmd = np.clip(cmd, -self.max_joint_speed, self.max_joint_speed)
         control_ms = (time.perf_counter() - t00) * 1000.0
@@ -474,110 +410,10 @@ class HorizontalPopTracker(Node):
 
         self._publish_velocity(cmd)
 
-    def _update_pop_state(self, now_mono, ball_pos, ball_vel):
-        ball_vel_z = float(ball_vel[2])
-        ball_clearance = float(ball_pos[2] - self._nominal_paddle_z)
-        
-        if not self._pop_armed:
-            rearm_clearance = self.pop_trigger_clearance + self.pop_rearm_hysteresis
-            if ball_clearance >= rearm_clearance:
-                self._pop_armed = True
-                self.get_logger().info(
-                    f'POP re-armed: ball_clearance={ball_clearance:.3f}m.'
-                )
-
-        if self._state == self.TRACK:
-            #Let's change this so that we trigger by speed
-
-            ready_by_height = ball_clearance <= self.pop_trigger_clearance
-            ready_by_velocity = ball_vel_z <= self.descending_velocity_threshold
-            ready_by_time = now_mono - self._last_pop_time >= self.min_pop_interval
-
-            if ready_by_height:
-                incoming_speed = max(0.0, -ball_vel_z)
-                self._pop_paddle_velocity = float(np.clip(
-                    self.hit_velocity_gain * incoming_speed,
-                    self.min_hit_velocity,
-                    self.max_hit_velocity,
-                ))
-                self._state = self.POP
-                self._pop_start_time = now_mono
-                self._pop_armed = False
-                self._last_pop_time = now_mono
-                self._reset_pid_integrators()
-                self.get_logger().info(
-                    f'POP start: ball_clearance={ball_clearance:.3f}m, '
-                    f'ball_vel_z={ball_vel_z:.3f}m/s, '
-                    f'pop_paddle_velocity={self._pop_paddle_velocity:.3f}m/s.'
-                )
-            return
-
-        if self._state == self.POP:
-            if now_mono - self._pop_start_time >= self.pop_hold_duration:
-                self._state = self.RECOVER
-                self._recover_start_time = now_mono
-                self._reset_pid_integrators()
-                self.get_logger().info('POP complete; recovering to locked height.')
-            return
-
-        if self._state == self.RECOVER:
-            if now_mono - self._recover_start_time >= self.recovery_duration:
-                self._state = self.TRACK
-                self._recover_start_time = None
-                self._reset_pid_integrators()
-                self.get_logger().info('Recovery complete; tracking XY at locked height.')
-
-    def _finish_pop_state_without_ball(self, now_mono):
-        if self._state == self.POP and now_mono - self._pop_start_time >= self.pop_hold_duration:
-            self._state = self.RECOVER
-            self._recover_start_time = now_mono
-            self._reset_pid_integrators()
-        elif (
-            self._state == self.RECOVER
-            and now_mono - self._recover_start_time >= self.recovery_duration
-        ):
-            self._state = self.TRACK
-            self._recover_start_time = None
-            self._reset_pid_integrators()
 
     def _reset_pid_integrators(self):
         self.pid.integral_error = np.zeros(6)
         self.pid_vertical.integral_error = np.zeros(6)
-
-
-    def _enforce_vertical_ceiling(self, now_mono, current_paddle_z):
-        ceiling_z = self._nominal_paddle_z + self.max_vertical_rise
-        if current_paddle_z < ceiling_z:
-            self._ceiling_active = False
-            return False
-
-        if not self._ceiling_active:
-            self.get_logger().warn(
-                f'Vertical ceiling hit: paddle_z={current_paddle_z:.3f}m '
-                f'>= ceiling_z={ceiling_z:.3f}m. Forcing recovery to '
-                f'{self._nominal_paddle_z:.3f}m.',
-                throttle_duration_sec=0.5,
-            )
-        self._ceiling_active = True
-        if self._state != self.RECOVER:
-            self._state = self.RECOVER
-            self._recover_start_time = now_mono
-            self._reset_pid_integrators()
-        return True
-
-    def _target_paddle_z(self, now_mono, current_paddle_z, over_ceiling=False):
-        if over_ceiling:
-            return self._nominal_paddle_z
-
-        ceiling_z = self._nominal_paddle_z + self.max_vertical_rise
-
-        #if self._state == self.POP:
-        return min(
-                current_paddle_z + self._pop_paddle_velocity * self.control_period * 1.5,
-                ceiling_z,
-            )
-
-        #return self._nominal_paddle_z
 
     def _publish_velocity(self, cmd):
         msg = Float64MultiArray()
@@ -613,6 +449,29 @@ class HorizontalPopTracker(Node):
             deactivate='forward_velocity_controller',
         )
 
+    def correct_quat(self, xyz_center, xyz_current_pos, xyzw_current_quat):
+        desired_normal = xyz_center - xyz_current_pos
+
+        # Default normal is [-1.0, 0.0, 0.0]. So negative first column.
+        current_normal =  -_quat_to_rot(*xyzw_current_quat)[:, 0]
+
+        axis = np.cross(current_normal,desired_normal)
+
+        if np.linalg.norm(axis) < 1e-6:
+            #Let the other functions handle the case when we're already at the center
+            return (-.66, .27, .66, .27)
+        
+        desired_normalized = desired_normal / np.linalg.norm(desired_normal)
+        curr_normalized = current_normal / np.linalg.norm(current_normal)
+
+        angle = np.arccos(np.clip(np.dot(desired_normalized, curr_normalized), -1.0, 1.0))
+        axis = axis / np.linalg.norm(np.asarray(axis, dtype=float))
+
+        correction_quat = quaternion_about_axis_np(angle, axis)
+
+        final_quat = _quat_multiply(correction_quat, xyzw_current_quat)
+
+        return final_quat
 
 def _reorder_positions(joint_state, order):
     name_to_pos = dict(zip(joint_state.name, joint_state.position))
@@ -682,45 +541,23 @@ def _quat_multiply(q1, q2):
         w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
     )
 
+def quaternion_about_axis_np(angle, axis):
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = np.linalg.norm(axis)
 
-def _level_paddle_quat(current_quat, paddle_normal_tool):
-    """Smallest-rotation correction of current_quat that makes the paddle face
-    normal point along base_link +z.
+    if norm < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
 
-    Decomposes the rotation into swing (around an axis perpendicular to the
-    face normal) and twist (around the face normal). We zero out the swing
-    needed to bring the face normal to vertical and leave the twist of the
-    current orientation untouched. Returns (leveled_quat, swing_angle_rad).
-    """
-    n_tool = np.asarray(paddle_normal_tool, dtype=np.float64)
-    n_tool = n_tool / max(float(np.linalg.norm(n_tool)), 1e-12)
-    R = _quat_to_rot(*current_quat)
-    n_base = R @ n_tool
-    n_base /= max(float(np.linalg.norm(n_base)), 1e-12)
-    target = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    cos_a = float(np.clip(np.dot(n_base, target), -1.0, 1.0))
-    axis = np.cross(n_base, target)
-    sin_a = float(np.linalg.norm(axis))
-    if sin_a < 1e-9:
-        if cos_a > 0.0:
-            return tuple(float(v) for v in current_quat), 0.0
-        # 180° flip — pick any axis perpendicular to n_base.
-        seed = np.array([1.0, 0.0, 0.0]) if abs(n_base[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        axis = seed - n_base * float(np.dot(seed, n_base))
-        axis /= max(float(np.linalg.norm(axis)), 1e-12)
-        sin_a = 1.0
-        cos_a = -1.0
-    else:
-        axis /= sin_a
-    angle = float(np.arctan2(sin_a, cos_a))
+    axis = axis / norm
     half = 0.5 * angle
-    s = float(np.sin(half))
-    correction = (axis[0] * s, axis[1] * s, axis[2] * s, float(np.cos(half)))
-    leveled = _quat_multiply(correction, current_quat)
-    norm = float(np.sqrt(sum(c * c for c in leveled)))
-    if norm > 1e-12:
-        leveled = tuple(c / norm for c in leveled)
-    return leveled, angle
+    s = np.sin(half)
+
+    return (
+        float(axis[0] * s),
+        float(axis[1] * s),
+        float(axis[2] * s),
+        float(np.cos(half)),
+    )
 
 
 def main(args=None):

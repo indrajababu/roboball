@@ -49,7 +49,6 @@ def generate_launch_description():
     launch_rviz = LaunchConfiguration('launch_rviz', default='true')
     marker_number = LaunchConfiguration('marker_number', default='-1')
     detector = LaunchConfiguration('detector', default='hsv')
-    strike_height = LaunchConfiguration('strike_height', default='0.60')
     start_strike_planner = LaunchConfiguration('start_strike_planner', default='false')
 
     realsense_launch = IncludeLaunchDescription(
@@ -125,32 +124,6 @@ def generate_launch_description():
         }],
     )
 
-    predictor_node = Node(
-        package='roboball_planning',
-        executable='trajectory_predictor',
-        name='trajectory_predictor',
-        output='screen',
-        parameters=[{
-            'strike_height': ParameterValue(strike_height, value_type=float),
-            'ball_radius': 0.033,
-            # Calibrated with the ball resting on the paddle:
-            # ball_center - planner_paddle_point in base_link.
-            'ball_to_paddle_offset': [-0.082, 0.094, 0.116],
-            # Extra clearance so small perception/TF errors do not command the
-            # paddle into the ball before the upward follow-through.
-            'ball_to_paddle_offset_margin': [0.0, 0.0, 0.015],
-            'target_paddle_under_ball': True,
-            'stationary_start_enabled': True,
-            'stationary_start_speed_threshold': 0.08,
-            'stationary_start_position_tolerance': 0.025,
-            'stationary_start_cooldown': 1.0,
-            'publish_only_when_descending': True,
-            'descending_velocity_threshold': -0.05,
-            'min_samples': 4,
-            'buffer_size': 12,
-        }],
-    )
-
     horizontal_pop_tracker_node = Node(
         package='roboball_planning',
         executable='horizontal_pop_tracker',
@@ -158,15 +131,11 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'lock_contact_height': True,
-            'control_period': 0.05,
+            'control_period': 0.01,
             'min_body_clearance_radius': 0.30,
-            'pop_trigger_clearance': 0.254,
-            'pop_height': 0.1524,
-            'max_vertical_rise': 0.1524,
-            'pop_hold_duration': 0.10,
-            'recovery_duration': 0.20,
-            'pop_rearm_hysteresis': 0.02,
-            'min_pop_interval': 0.45,
+            'pop_trigger_clearance': 0.40,
+            'pop_height': 0.24,
+            'max_vertical_rise': 0.24,
             'descending_velocity_threshold': -0.05,
             'ball_timeout': 0.35,
             'ik_timeout': 0.06,
@@ -177,7 +146,7 @@ def generate_launch_description():
             # 7 inches from the tool0 origin to the paddle contact point.
             # Adjust axis/sign if the physical paddle points along a different
             # tool0-frame direction.
-            'paddle_offset_tool0': [0.0, 0.0, 0.1778],
+            'paddle_offset_tool0': [0.0, 0.0, 0.23],
             'ball_to_paddle_offset': [-0.082, 0.094, 0.116],
             'ball_to_paddle_offset_margin': [0.0, 0.0, 0.0],
         }],
@@ -203,7 +172,6 @@ def generate_launch_description():
         static_tf_node,
         validator_node,
         ball_detector_node,
-        predictor_node,
         horizontal_pop_tracker_node,
         # shutdown_on_any_exit,  # disabled during debugging — re-enable for demo
     ])
