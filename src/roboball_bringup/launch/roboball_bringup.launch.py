@@ -49,6 +49,7 @@ def generate_launch_description():
     launch_rviz = LaunchConfiguration('launch_rviz', default='true')
     marker_number = LaunchConfiguration('marker_number', default='-1')
     detector = LaunchConfiguration('detector', default='hsv')
+    strike_height = LaunchConfiguration('strike_height', default='0.60')
     start_strike_planner = LaunchConfiguration('start_strike_planner', default='false')
 
     realsense_launch = IncludeLaunchDescription(
@@ -123,6 +124,31 @@ def generate_launch_description():
             'cloud_stride': 2,
         }],
     )
+    predictor_node = Node(
+        package='roboball_planning',
+        executable='trajectory_predictor',
+        name='trajectory_predictor',
+        output='screen',
+        parameters=[{
+            'strike_height': ParameterValue(strike_height, value_type=float),
+            'ball_radius': 0.033,
+            # Calibrated with the ball resting on the paddle:
+            # ball_center - planner_paddle_point in base_link.
+            'ball_to_paddle_offset': [-0.082, 0.094, 0.116],
+            # Extra clearance so small perception/TF errors do not command the
+            # paddle into the ball before the upward follow-through.
+            'ball_to_paddle_offset_margin': [0.0, 0.0, 0.015],
+            'target_paddle_under_ball': True,
+            'stationary_start_enabled': True,
+            'stationary_start_speed_threshold': 0.08,
+            'stationary_start_position_tolerance': 0.025,
+            'stationary_start_cooldown': 1.0,
+            'publish_only_when_descending': True,
+            'descending_velocity_threshold': -0.05,
+            'min_samples': 4,
+            'buffer_size': 12,
+        }],
+    )
 
     horizontal_pop_tracker_node = Node(
         package='roboball_planning',
@@ -172,6 +198,7 @@ def generate_launch_description():
         static_tf_node,
         validator_node,
         ball_detector_node,
+        predictor_node,
         horizontal_pop_tracker_node,
         # shutdown_on_any_exit,  # disabled during debugging — re-enable for demo
     ])

@@ -42,7 +42,6 @@ HORIZONTAL_TOOL_QUAT = (0.0, float(np.sqrt(0.5)), 0.0, float(np.sqrt(0.5)))
 # Direction of the paddle face normal expressed in tool0 frame. With the
 # calibrated horizontal quaternion (≈90° about base_y), tool -x maps to base
 # +z, so the paddle face must be normal to tool -x. Override via parameter if
-# the paddle is remounted on a different axis.
 DEFAULT_PADDLE_NORMAL_TOOL0 = [-1.0, 0.0, 0.0]
 
 
@@ -280,11 +279,8 @@ class HorizontalPopTracker(Node):
 
         target_xy = current_paddle_xyz[:2]
 
-        should_bounce = False
-
         if self._last_target_xy is not None:
             target_xy = self._last_target_xy.copy()
-
 
         if ball_valid:
             ball_pos = np.array([
@@ -320,7 +316,7 @@ class HorizontalPopTracker(Node):
 
         should_pop_up = (
             0.0 <= ball_clearance <= self.pop_trigger_clearance
-            or 0.03 <= time_to_contact <= self.bounce_lead_time
+            and 0.03 <= time_to_contact <= self.bounce_lead_time
         )
 
         high_z = min(
