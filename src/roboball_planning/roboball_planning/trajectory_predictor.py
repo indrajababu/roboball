@@ -216,11 +216,7 @@ class TrajectoryPredictor(Node):
         target.impact_pose.position.x = float(paddle_xyz[0])
         target.impact_pose.position.y = float(paddle_xyz[1])
         target.impact_pose.position.z = float(paddle_xyz[2])
-        # Paddle is mounted on the side of tool0; the wrist orientation that
-        # leaves the paddle face pointing ~up in base_link is the home pose
-        # captured below (measured via `tf2_echo base_link tool0`). Holding the
-        # wrist at this orientation across the strike means the IK only has to
-        # translate to the impact XY, not re-rotate the paddle.
+
         target.impact_pose.orientation.x = -0.007
         target.impact_pose.orientation.y = 0.699
         target.impact_pose.orientation.z = 0.0
@@ -257,7 +253,6 @@ class TrajectoryPredictor(Node):
         t0 = ts[-1]
         dt = ts - t0
 
-        # Guard against degenerate timestamps (all samples at same time).
         if np.ptp(dt) < 1e-6:
             return None
 

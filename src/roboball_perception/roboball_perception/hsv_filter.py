@@ -41,7 +41,6 @@ def hsv_mask_from_bgr(bgr: np.ndarray, ranges: Sequence[HSVRange]) -> np.ndarray
     if n == 0:
         return np.zeros(0, dtype=bool)
 
-    # OpenCV accepts Nx1x3 or 1xNx3. Nx1x3 is natural for point lists.
     hsv = cv2.cvtColor(bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV)
 
     if len(ranges) == 1:

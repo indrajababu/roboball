@@ -29,10 +29,10 @@ from threading import Lock
 class BallDetectionVisualizer(Node):
     def __init__(self):
         super().__init__('ball_detection_visualizer')
-        self.centroid = None   # 3-element float64 in target_frame
-        self.points = None     # Nx3 float64 in target_frame
-        self.bgr = None        # latest color image
-        self.color_K = None    # 3x3 intrinsics
+        self.centroid = None
+        self.points = None
+        self.bgr = None
+        self.color_K = None
         self.lock = Lock()
         self.bridge = CvBridge()
 
