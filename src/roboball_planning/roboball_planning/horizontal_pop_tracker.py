@@ -35,14 +35,7 @@ IK_LINK_NAME = 'tool0'
 INCH_TO_M = 0.0254
 DEFAULT_PADDLE_OFFSET_TOOL0 = [0.0, 0.0, 7.0 * INCH_TO_M]
 DEFAULT_BALL_TO_PADDLE_OFFSET = [-0.082, 0.094, 0.116]
-# Pure 90° rotation about base_link y. With the paddle mounted square on tool0,
-# this puts the paddle face normal exactly along base_link +z (perfectly
-# horizontal). (qx, qy, qz, qw).
 HORIZONTAL_TOOL_QUAT = (0.0, float(np.sqrt(0.5)), 0.0, float(np.sqrt(0.5)))
-# Direction of the paddle face normal expressed in tool0 frame. With the
-# calibrated horizontal quaternion (≈90° about base_y), tool -x maps to base
-# +z, so the paddle face must be normal to tool -x. Override via parameter if
-# the paddle is remounted on a different axis.
 DEFAULT_PADDLE_NORMAL_TOOL0 = [-1.0, 0.0, 0.0]
 
 
