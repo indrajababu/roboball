@@ -1,13 +1,5 @@
 """
 Strike objective policies for high-level bounce behavior.
-
-These policies sit between trajectory prediction and execution:
-  - Input: raw predicted impact point from `/strike_target`.
-  - Output: adjusted impact point passed to IK / strike execution.
-
-Current implementations are conservative stubs so the system remains safe:
-they primarily clamp or lightly reshape xy targets. Future work can add
-contact-angle and paddle-velocity shaping to actively steer rebounds.
 """
 
 from dataclasses import dataclass
