@@ -87,7 +87,7 @@ class StrikePlanner(Node):
 
         self.ik_link_name = IK_LINK_NAME
 
-        # PID gains seeded from lab7/visual_servoing/main.py:58-60.
+        # PID gains based off of lab7
         Kp = 0.2 * np.array([0.4, 2.0, 1.7, 1.5, 2.0, 2.0])
         Kd = 0.01 * np.array([2.0, 1.0, 2.0, 0.5, 0.8, 0.8])
         Ki = 0.01 * np.array([1.4, 1.4, 1.4, 1.0, 0.6, 0.6])

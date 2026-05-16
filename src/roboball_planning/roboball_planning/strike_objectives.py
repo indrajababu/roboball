@@ -64,14 +64,12 @@ class StrikeObjectivePolicy:
         return impact_xyz.copy()
 
     def _center_spot(self, impact_xyz: np.ndarray) -> np.ndarray:
-        # Stub: nudge the target toward one desired xy location.
         target = impact_xyz.copy()
         center = np.array(self.config.center_xy, dtype=np.float64)
         target[:2] = (1.0 - self.config.blend_gain) * target[:2] + self.config.blend_gain * center
         return target
 
     def _xy_zone(self, impact_xyz: np.ndarray) -> np.ndarray:
-        # Stub: clamp impact to stay inside a permitted rectangle.
         target = impact_xyz.copy()
         zone_min = np.array(self.config.zone_min_xy, dtype=np.float64)
         zone_max = np.array(self.config.zone_max_xy, dtype=np.float64)
@@ -95,7 +93,6 @@ class StrikeObjectivePolicy:
         return target
 
     def _circle(self, impact_xyz: np.ndarray, now_sec: float) -> np.ndarray:
-        # Stub: move desired xy point around a time-varying circle.
         target = impact_xyz.copy()
         theta = self.config.circle_speed_rad_s * now_sec
         cx, cy = self.config.circle_center_xy

@@ -39,8 +39,6 @@ import numpy as np
 
 from roboball_perception.hsv_filter import HSVRange, hsv_mask_from_packed_rgb
 
-# ROS imports are deferred so this file can be run as a tuner on a laptop
-# without ROS installed (`python3 ball_detector.py --tune ...`).
 try:
     import rclpy
     from rclpy.node import Node
@@ -83,8 +81,6 @@ class BallDetector(Node):
         self.color_frame = self.declare_parameter(
             'color_frame', 'camera_color_optical_frame'
         ).value
-        # HSV path uses depth-optical as the cloud's frame (matches the
-        # /depth/color/points output); kept configurable for sim variants.
         self.source_frame = self.declare_parameter(
             'source_frame', 'camera_depth_optical_frame'
         ).value
@@ -111,11 +107,6 @@ class BallDetector(Node):
         self.yolo_imgsz = int(self.declare_parameter('yolo_imgsz', 640).value)
 
         # ---- HSV params -------------------------------------------------
-        # Defaults carried over from commit 8ea3c1e — tuned for the lab beach
-        # ball under lab lighting (red/orange wedge: H≈0-12, high S, V>=80).
-        # Re-tune with --tune if the ball or lighting changes. Set hsv_upper2
-        # to all-zeros to disable the second range (used for red wraparound
-        # when lower1 already starts at H=0).
         self.hsv_lower1 = list(self.declare_parameter('hsv_lower1', [0, 120, 80]).value)
         self.hsv_upper1 = list(self.declare_parameter('hsv_upper1', [12, 255, 255]).value)
         self.hsv_lower2 = list(self.declare_parameter('hsv_lower2', [0, 0, 0]).value)
@@ -144,9 +135,7 @@ class BallDetector(Node):
         if self.detector_mode == 'yolo':
             self._load_yolo(self.yolo_weights)
 
-        # Subscriptions are shared. Image + camera_info are only consumed by
-        # the YOLO path, but keeping them subscribed lets the user toggle
-        # backends at runtime via `ros2 param set`.
+
         self.create_subscription(
             Image, '/camera/camera/color/image_raw',
             self._on_image, qos_profile_sensor_data,
@@ -658,7 +647,6 @@ def main(args=None):
 
     if '--tune' in argv:
         import argparse
-        # Strip the `--ros-args ...` tail that `ros2 run` appends.
         if '--ros-args' in argv:
             argv = argv[:argv.index('--ros-args')]
         parser = argparse.ArgumentParser(prog='ball_detector --tune')
