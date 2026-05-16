@@ -48,10 +48,6 @@ DEFAULT_PADDLE_NORMAL_TOOL0 = [-1.0, 0.0, 0.0]
 class HorizontalPopTracker(Node):
     """Track ball XY at a locked height, popping once when the ball gets close."""
 
-    TRACK = 'track'
-    POP = 'pop'
-    RECOVER = 'recover'
-
     def __init__(self):
         super().__init__('horizontal_pop_tracker')
         self._cb_group = ReentrantCallbackGroup()
