@@ -62,7 +62,7 @@ class IKPlanner(Node):
         ik_req.ik_request.pose_stamped = pose
         ik_req.ik_request.ik_link_name = ik_link_name
         ik_req.ik_request.robot_state.joint_state = current_joint_state
-        ik_req.ik_request.avoid_collisions = False
+        ik_req.ik_request.avoid_collisions = True
         ik_req.ik_request.timeout = Duration(
             sec=int(timeout_sec),
             nanosec=int((timeout_sec % 1.0) * 1e9),

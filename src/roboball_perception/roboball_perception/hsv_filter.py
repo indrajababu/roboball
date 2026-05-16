@@ -1,3 +1,9 @@
+"""Tiny HSV helper for filtering colored point clouds.
+
+RealSense `PointCloud2` uses a packed float `rgb` field (PCL style):
+0x00 RR GG BB. We unpack that and run an HSV inRange.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,7 +15,6 @@ import numpy as np
 
 @dataclass
 class HSVRange:
-    """Inclusive HSV bounds. OpenCV convention: H in [0, 179], S/V in [0, 255]."""
     lower: Sequence[int]
     upper: Sequence[int]
 

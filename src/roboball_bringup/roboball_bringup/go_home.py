@@ -147,6 +147,10 @@ class GoHome(Node):
         traj.points.append(point2)
         traj.points.append(point3)
 
+        # Wait for the validate_trajectory subscriber to connect before publishing.
+        self.get_logger().info('Waiting for /joint_trajectory_validated subscriber...')
+        while self.pub.get_subscription_count() == 0:
+            time.sleep(0.1)
         self.pub.publish(traj)
 
         self.get_logger().info("Published direct joint-space home trajectory.")
